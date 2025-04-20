@@ -1,0 +1,110 @@
+### Python ###
+# Байткод / оптимизированные / DLL файлы
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+### Виртуальные окружения ###
+venv/
+env/
+ENV/
+.env
+.venv
+env.bak/
+venv.bak/
+
+### Дистрибутивы и сборки ###
+dist/
+build/
+*.egg-info/
+.eggs/
+*.egg
+
+### Локальные данные ###
+*.sqlite3
+*.db
+*.sqlite
+data/
+
+### Логи ###
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+### Редакторы кода ###
+# VSCode
+.vscode/
+.history
+*.code-workspace
+
+# PyCharm/IntelliJ
+.idea/
+*.iml
+*.iws
+*.ipr
+.idea_modules/
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+### Тесты и покрытие ###
+.coverage
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.pytest_cache/
+cover/
+
+### Jupyter Notebook ###
+.ipynb_checkpoints
+
+### Конфигурационные файлы ###
+# Реальные конфигурационные файлы не должны быть в репозитории
+.env
+*.env
+config.ini
+credentials.json
+
+### Redis ###
+*.rdb
+dump.rdb
+
+### Docker ###
+docker-compose.override.yml
+
+### Операционные системы ###
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msm
+*.msp
+*.lnk
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+### Другое ###
+.cache/
+tmp/
+temp/
