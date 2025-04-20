@@ -77,18 +77,18 @@ alembic upgrade head
 
 - API-сервер:
 ```
-bashuvicorn app.main:app --reload
+uvicorn app.main:app --reload
 ```
 
 
 - Celery Worker:
 ```
-bashcelery -A app.tasks.celery_app worker --loglevel=info
+celery -A app.tasks.celery_app worker --loglevel=info
 ```
 
 
 - Celery Beat (для запланированных задач):
 
 ```
-bashcelery -A app.tasks.celery_app beat --loglevel=info
+celery -A app.tasks.celery_app beat --loglevel=info
 ```
