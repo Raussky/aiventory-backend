@@ -14,6 +14,9 @@ ENV/
 .venv
 env.bak/
 venv.bak/
+# Conda
+.conda/
+inventory/
 
 ### Дистрибутивы и сборки ###
 dist/
