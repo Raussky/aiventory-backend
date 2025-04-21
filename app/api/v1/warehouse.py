@@ -8,7 +8,8 @@ import datetime
 
 from app.db.session import get_db
 from app.models.users import User
-from app.models.inventory import Product, Category, Upload, WarehouseItem, WarehouseItemStatus, StoreItem, StoreItemStatus
+from app.models.inventory import Product, Category, Upload, WarehouseItem, WarehouseItemStatus, StoreItem, \
+    StoreItemStatus, Currency
 from app.models.base import Base
 from app.schemas.inventory import (
     WarehouseItemResponse, UploadResponse, WarehouseItemCreate
@@ -18,6 +19,8 @@ from app.core.dependencies import get_current_user
 from app.services.file_parser import detect_and_parse_file
 from app.services.barcode import decode_barcode_from_base64
 from app.db.redis import get_redis
+from app.services.pricing import calculate_store_price, suggest_discount, suggest_warehouse_action
+
 router = APIRouter()
 
 
@@ -80,6 +83,8 @@ async def upload_file(
                     barcode=str(record.get('barcode')) if record.get('barcode') is not None else None,
                     default_unit=record.get('unit'),
                     default_price=float(record.get('price')) if record.get('price') is not None else None,
+                    currency=Currency.KZT,
+                    storage_duration=int(record.get('storage_duration', 30)),
                 )
                 db.add(product)
                 await db.commit()
@@ -125,6 +130,7 @@ async def upload_file(
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
+
 @router.get("/items", response_model=List[WarehouseItemResponse])
 async def get_warehouse_items(
         skip: int = 0,
@@ -134,8 +140,10 @@ async def get_warehouse_items(
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
 ):
-    # Используем selectinload для eager loading связанного продукта
-    query = select(WarehouseItem).options(selectinload(WarehouseItem.product))
+    # Используем selectinload для eager loading связанного продукта И категории
+    query = select(WarehouseItem).options(
+        selectinload(WarehouseItem.product).selectinload(Product.category)
+    )
 
     if upload_sid:
         query = query.where(WarehouseItem.upload_sid == upload_sid)
@@ -156,7 +164,6 @@ async def get_warehouse_items(
     )
     items = result.scalars().all()
 
-    # Создаем список объектов WarehouseItemResponse вручную для гарантии правильного сериализации
     response_items = []
     for item in items:
         response_item = WarehouseItemResponse(
@@ -168,19 +175,19 @@ async def get_warehouse_items(
             expire_date=item.expire_date,
             received_at=item.received_at,
             status=item.status,
-            product=item.product  # Теперь это безопасно, так как мы предварительно загрузили продукт
+            product=item.product  # Теперь продукт включает категорию
         )
         response_items.append(response_item)
 
     return response_items
 
 
-@router.post("/to-store", response_model=Dict[str, str])
+@router.post("/to-store", response_model=Dict[str, Any])
 async def move_to_store(
         barcode_image: str = Form(None),
         item_sid: str = Form(None),
         quantity: int = Form(...),
-        price: float = Form(...),
+        price: float = Form(None),  # Сделали опциональным для использования рекомендуемой цены
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
         redis: Redis = Depends(get_redis),
@@ -197,7 +204,7 @@ async def move_to_store(
 
         # Находим продукт по штрих-коду
         product_query = await db.execute(
-            select(Product).where(Product.barcode == barcode)
+            select(Product).options(selectinload(Product.category)).where(Product.barcode == barcode)
         )
         product = product_query.scalar_one_or_none()
 
@@ -234,7 +241,9 @@ async def move_to_store(
 
     try:
         warehouse_query = await db.execute(
-            select(WarehouseItem).where(WarehouseItem.sid == item_sid)
+            select(WarehouseItem)
+            .options(selectinload(WarehouseItem.product).selectinload(Product.category))
+            .where(WarehouseItem.sid == item_sid)
         )
         warehouse_item = warehouse_query.scalar_one_or_none()
 
@@ -250,12 +259,40 @@ async def move_to_store(
                 detail=f"Not enough quantity available (requested: {quantity}, available: {warehouse_item.quantity})"
             )
 
+        # Рассчитываем рекомендуемую цену, если не указана пользователем
+        product = warehouse_item.product
+        category = product.category
+        base_price = product.default_price or 0
+
+        suggested_price = calculate_store_price(
+            warehouse_item=warehouse_item,
+            base_price=base_price,
+            category=category
+        )
+
+        # Используем предоставленную цену или рекомендуемую
+        final_price = price if price is not None else suggested_price
+
+        # Получаем рекомендации по скидкам
+        discount_suggestion = suggest_discount(
+            warehouse_item=warehouse_item,
+            store_price=final_price,
+            base_price=base_price,
+            category=category
+        )
+
+        # Получаем рекомендации по действиям со складом
+        warehouse_action = suggest_warehouse_action(
+            warehouse_item=warehouse_item,
+            category=category
+        )
+
         # Создаем запись в магазине
         store_item = StoreItem(
             sid=Base.generate_sid(),
             warehouse_item_sid=warehouse_item.sid,
             quantity=quantity,
-            price=price,
+            price=final_price,
             moved_at=datetime.datetime.utcnow(),
             status=StoreItemStatus.ACTIVE,
         )
@@ -270,7 +307,23 @@ async def move_to_store(
 
         await db.commit()
 
-        return {"message": "Item moved to store successfully", "store_item_sid": store_item.sid}
+        response = {
+            "message": "Item moved to store successfully",
+            "store_item_sid": store_item.sid,
+            "price": final_price
+        }
+
+        # Включаем рекомендации по ценам и скидкам в ответ
+        if price is None:
+            response["suggested_price"] = suggested_price
+
+        if discount_suggestion:
+            response["discount_suggestion"] = discount_suggestion
+
+        if warehouse_action:
+            response["warehouse_action"] = warehouse_action
+
+        return response
 
     finally:
         # Освобождаем лок

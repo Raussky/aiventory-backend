@@ -3,6 +3,12 @@ from typing import Optional, List, Union
 from datetime import date, datetime
 from enum import Enum
 
+class Currency(str, Enum):
+    KZT = "kzt"
+    USD = "usd"
+    EUR = "eur"
+    RUB = "rub"
+
 class CategoryBase(BaseModel):
     name: str
 
@@ -21,12 +27,15 @@ class ProductBase(BaseModel):
     barcode: Optional[str] = None
     default_unit: Optional[str] = None
     default_price: Optional[float] = None
+    currency: Optional[Currency] = Currency.KZT
+    storage_duration: Optional[int] = 30
 
 class ProductCreate(ProductBase):
     pass
 
 class ProductResponse(ProductBase):
     sid: str
+    category: Optional[CategoryResponse] = None
 
     class Config:
         from_attributes = True

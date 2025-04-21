@@ -7,6 +7,13 @@ import enum
 from app.models.base import Base
 
 
+class Currency(str, enum.Enum):
+    KZT = "kzt"  # Tenge
+    USD = "usd"  # US Dollar
+    EUR = "eur"  # Euro
+    RUB = "rub"  # Russian Ruble
+
+
 class Category(Base):
     name = Column(String, unique=True, nullable=False)
     products = relationship("Product", back_populates="category")
@@ -19,6 +26,8 @@ class Product(Base):
     barcode = Column(String, unique=True)
     default_unit = Column(String)
     default_price = Column(Float)
+    currency = Column(Enum(Currency), default=Currency.KZT)
+    storage_duration = Column(Integer, default=30)  # Default storage duration in days
 
     warehouse_items = relationship("WarehouseItem", back_populates="product")
     predictions = relationship("Prediction", back_populates="product")
