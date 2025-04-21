@@ -6,14 +6,14 @@ from aioredis import Redis
 import random
 import string
 from datetime import datetime, timedelta
-
+from sqlalchemy import select
 from app.core.security import create_access_token, verify_password, get_password_hash
 from app.db.session import get_db
 from app.db.redis import get_redis
 from app.models.users import User, VerificationToken
 from app.schemas.user import UserCreate, UserResponse, UserVerify, UserLogin
 from app.services.email import send_verification_email
-
+from app.models.base import Base
 router = APIRouter()
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"/api/v1/auth/login")

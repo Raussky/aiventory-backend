@@ -4,8 +4,13 @@ from app.core.config import settings
 from typing import List, Dict, Any
 from loguru import logger
 from celery import shared_task
+import os
 
-# Настройка соединения с SMTP (исправленная)
+# Флаг для определения режима разработки/тестирования
+# Проверяем наличие переменной окружения, если её нет, проверяем домен SMTP-сервера
+DEV_MODE = os.getenv("DEV_MODE", "0") == "1" or settings.SMTP_HOST == "smtp.example.com"
+
+# Настройка соединения с SMTP
 conf = ConnectionConfig(
     MAIL_USERNAME=settings.SMTP_USER,
     MAIL_PASSWORD=settings.SMTP_PASSWORD,
@@ -13,8 +18,8 @@ conf = ConnectionConfig(
     MAIL_PORT=settings.SMTP_PORT,
     MAIL_SERVER=settings.SMTP_HOST,
     MAIL_FROM_NAME=settings.EMAILS_FROM_NAME,
-    MAIL_STARTTLS=settings.SMTP_TLS,      # Было MAIL_TLS
-    MAIL_SSL_TLS=False,                   # Было MAIL_SSL
+    MAIL_STARTTLS=settings.SMTP_TLS,
+    MAIL_SSL_TLS=False,
     USE_CREDENTIALS=True,
     VALIDATE_CERTS=True
 )
@@ -28,8 +33,14 @@ async def send_email(
         template_body: Dict[str, Any] = None
 ):
     """
-    Отправляет email с помощью FastMail
+    Отправляет email с помощью FastMail или эмулирует отправку в режиме разработки
     """
+    # В режиме разработки просто логируем письмо без реальной отправки
+    if DEV_MODE:
+        logger.info(f"DEV MODE: Email to {email_to}, subject: {subject}")
+        logger.info(f"DEV MODE: Email body: {body[:100]}...")  # Логируем начало тела письма
+        return True
+
     try:
         # Создаем объект сообщения
         message = MessageSchema(
