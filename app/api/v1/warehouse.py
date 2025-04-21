@@ -2,12 +2,14 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy.orm import selectinload
 from typing import List, Dict, Any
 import datetime
 
 from app.db.session import get_db
 from app.models.users import User
-from app.models.inventory import Product, Category, Upload, WarehouseItem
+from app.models.inventory import Product, Category, Upload, WarehouseItem, WarehouseItemStatus, StoreItem, StoreItemStatus
+from app.models.base import Base
 from app.schemas.inventory import (
     WarehouseItemResponse, UploadResponse, WarehouseItemCreate
 )
@@ -43,44 +45,60 @@ async def upload_file(
 
         # Обрабатываем данные и создаем записи в базе
         for record in records:
-            # Находим или создаем продукт по штрих-коду/имени
+            # Находим или создаем категорию
+            category_name = record.get('category', 'Default')
+            category_query = await db.execute(
+                select(Category).where(Category.name == category_name)
+            )
+            category = category_query.scalar_one_or_none()
+
+            if not category:
+                category = Category(
+                    sid=Base.generate_sid(),
+                    name=category_name,
+                )
+                db.add(category)
+                await db.commit()
+                await db.refresh(category)
+
+            # Находим продукт по имени в данной категории
+            product_name = record.get('name')
             product_query = await db.execute(
                 select(Product).where(
-                    (Product.barcode == record.get('barcode')) |
-                    (Product.name == record.get('name'))
+                    (Product.name == product_name) &
+                    (Product.category_sid == category.sid)
                 )
             )
             product = product_query.scalar_one_or_none()
 
             if not product:
-                # Находим или создаем категорию
-                category_name = record.get('category', 'Default')
-                category_query = await db.execute(
-                    select(Category).where(Category.name == category_name)
-                )
-                category = category_query.scalar_one_or_none()
-
-                if not category:
-                    category = Category(
-                        sid=Base.generate_sid(),
-                        name=category_name,
-                    )
-                    db.add(category)
-                    await db.commit()
-                    await db.refresh(category)
-
                 # Создаем новый продукт
                 product = Product(
                     sid=Base.generate_sid(),
                     category_sid=category.sid,
-                    name=record.get('name'),
-                    barcode=record.get('barcode'),
+                    name=product_name,
+                    barcode=str(record.get('barcode')) if record.get('barcode') is not None else None,
                     default_unit=record.get('unit'),
-                    default_price=record.get('price'),
+                    default_price=float(record.get('price')) if record.get('price') is not None else None,
                 )
                 db.add(product)
                 await db.commit()
                 await db.refresh(product)
+
+            # Преобразуем строковые даты в объекты datetime.date
+            expire_date = None
+            if record.get('expire_date'):
+                if isinstance(record.get('expire_date'), str):
+                    expire_date = datetime.datetime.strptime(record.get('expire_date'), '%Y-%m-%d').date()
+                else:
+                    expire_date = record.get('expire_date')
+
+            received_at = datetime.date.today()
+            if record.get('received_at'):
+                if isinstance(record.get('received_at'), str):
+                    received_at = datetime.datetime.strptime(record.get('received_at'), '%Y-%m-%d').date()
+                else:
+                    received_at = record.get('received_at')
 
             # Создаем складскую запись
             warehouse_item = WarehouseItem(
@@ -88,9 +106,9 @@ async def upload_file(
                 upload_sid=upload.sid,
                 product_sid=product.sid,
                 batch_code=record.get('batch_code'),
-                quantity=record.get('quantity', 0),
-                expire_date=record.get('expire_date'),
-                received_at=record.get('received_at', datetime.date.today()),
+                quantity=int(record.get('quantity', 0)),
+                expire_date=expire_date,
+                received_at=received_at,
                 status=WarehouseItemStatus.IN_STOCK,
             )
             db.add(warehouse_item)
@@ -107,7 +125,6 @@ async def upload_file(
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
-
 @router.get("/items", response_model=List[WarehouseItemResponse])
 async def get_warehouse_items(
         skip: int = 0,
@@ -117,7 +134,8 @@ async def get_warehouse_items(
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
 ):
-    query = select(WarehouseItem).join(Product)
+    # Используем selectinload для eager loading связанного продукта
+    query = select(WarehouseItem).options(selectinload(WarehouseItem.product))
 
     if upload_sid:
         query = query.where(WarehouseItem.upload_sid == upload_sid)
@@ -138,7 +156,23 @@ async def get_warehouse_items(
     )
     items = result.scalars().all()
 
-    return items
+    # Создаем список объектов WarehouseItemResponse вручную для гарантии правильного сериализации
+    response_items = []
+    for item in items:
+        response_item = WarehouseItemResponse(
+            sid=item.sid,
+            product_sid=item.product_sid,
+            upload_sid=item.upload_sid,
+            batch_code=item.batch_code,
+            quantity=item.quantity,
+            expire_date=item.expire_date,
+            received_at=item.received_at,
+            status=item.status,
+            product=item.product  # Теперь это безопасно, так как мы предварительно загрузили продукт
+        )
+        response_items.append(response_item)
+
+    return response_items
 
 
 @router.post("/to-store", response_model=Dict[str, str])
