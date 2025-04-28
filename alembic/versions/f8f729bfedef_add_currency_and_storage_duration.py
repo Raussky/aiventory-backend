@@ -1,8 +1,8 @@
-"""Add storage duration type
+"""Add currency and storage_duration
 
-Revision ID: %(revision_id)s
-Revises: f8f729bfedef
-Create Date: %(create_date)s
+Revision ID: f8f729bfedef
+Revises: 08359cc8a297
+Create Date: 2025-04-21 19:10:58.960032
 
 """
 from typing import Sequence, Union
@@ -12,28 +12,28 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision = '%(revision_id)s'
-down_revision = 'f8f729bfedef'
-branch_labels = None
-depends_on = None
+revision: str = 'f8f729bfedef'
+down_revision: Union[str, None] = '08359cc8a297'
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # Создаем ENUM тип
-    storage_duration_type = sa.Enum('DAY', 'MONTH', 'YEAR', name='storagedurationtype')
-    storage_duration_type.create(op.get_bind(), checkfirst=True)
+    """Upgrade schema."""
+    # Сначала создаем тип ENUM
+    currency_enum = sa.Enum('KZT', 'USD', 'EUR', 'RUB', name='currency')
+    currency_enum.create(op.get_bind(), checkfirst=True)
 
-    # Затем добавляем столбец с использованием этого типа
-    op.add_column('product',
-                  sa.Column('storage_duration_type',
-                            sa.Enum('DAY', 'MONTH', 'YEAR', name='storagedurationtype'),
-                            server_default='DAY',
-                            nullable=False))
+    # Затем добавляем колонки
+    op.add_column('product', sa.Column('currency', currency_enum, server_default='KZT', nullable=False))
+    op.add_column('product', sa.Column('storage_duration', sa.Integer(), server_default='30', nullable=False))
 
 
 def downgrade() -> None:
-    # Удаляем столбец
-    op.drop_column('product', 'storage_duration_type')
+    """Downgrade schema."""
+    # Удаляем колонки
+    op.drop_column('product', 'storage_duration')
+    op.drop_column('product', 'currency')
 
-    # Удаляем ENUM тип
-    op.execute('DROP TYPE storagedurationtype')
+    # Удаляем ENUM тип после удаления колонки
+    sa.Enum(name='currency').drop(op.get_bind(), checkfirst=True)
