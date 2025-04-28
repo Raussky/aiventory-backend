@@ -14,6 +14,12 @@ class Currency(str, enum.Enum):
     RUB = "rub"  # Russian Ruble
 
 
+class StorageDurationType(str, enum.Enum):
+    DAY = "day"
+    MONTH = "month"
+    YEAR = "year"
+
+
 class Category(Base):
     name = Column(String, unique=True, nullable=False)
     products = relationship("Product", back_populates="category")
@@ -27,7 +33,8 @@ class Product(Base):
     default_unit = Column(String)
     default_price = Column(Float)
     currency = Column(Enum(Currency), default=Currency.KZT)
-    storage_duration = Column(Integer, default=30)  # Default storage duration in days
+    storage_duration = Column(Integer, default=30)  # Storage duration value
+    storage_duration_type = Column(Enum(StorageDurationType), default=StorageDurationType.DAY)  # Storage duration type (day, month, year)
 
     warehouse_items = relationship("WarehouseItem", back_populates="product")
     predictions = relationship("Prediction", back_populates="product")

@@ -1,21 +1,25 @@
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy import text
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
+import json
 from redis.asyncio import Redis
 from app.db.session import get_db
 from app.db.redis import get_redis
 from app.models.users import User
-from app.models.inventory import StoreItem, StoreItemStatus, Discount, Sale
+from app.models.inventory import StoreItem, StoreItemStatus, Discount, Sale, WarehouseItem
 from app.schemas.store import (
     StoreItemResponse, StoreItemCreate, DiscountCreate,
     DiscountResponse, SaleCreate, SaleResponse
 )
+from app.schemas.inventory import ProductResponse
+from app.models.base import Base
 from app.core.dependencies import get_current_user
 
 router = APIRouter()
-
 
 @router.get("/items", response_model=List[StoreItemResponse])
 async def get_store_items(

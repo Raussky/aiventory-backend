@@ -1,6 +1,7 @@
 # app/services/pricing.py
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
+from app.models.inventory import StorageDurationType
 
 
 def calculate_warehouse_stay_limit(product, category) -> int:
@@ -11,20 +12,27 @@ def calculate_warehouse_stay_limit(product, category) -> int:
     if not product.storage_duration:
         return 30  # По умолчанию, если срок хранения не указан
 
+    # Convert storage_duration to days based on type
+    storage_duration_days = product.storage_duration
+    if product.storage_duration_type == StorageDurationType.MONTH:
+        storage_duration_days = product.storage_duration * 30
+    elif product.storage_duration_type == StorageDurationType.YEAR:
+        storage_duration_days = product.storage_duration * 365
+
     # Для скоропортящихся товаров (молоко и т.д.) - не более половины срока хранения
     if category.name.lower() in ["dairy", "milk", "молоко", "молочные", "йогурт", "кисломолочные"]:
-        return max(1, product.storage_duration // 2)
+        return max(1, storage_duration_days // 2)
 
     # Для хлебобулочных изделий - не более 1/3 срока хранения
     if category.name.lower() in ["bakery", "bread", "хлеб", "выпечка", "хлебобулочные"]:
-        return max(1, product.storage_duration // 3)
+        return max(1, storage_duration_days // 3)
 
     # Для мяса и рыбы - не более 2/3 срока хранения
     if category.name.lower() in ["meat", "fish", "seafood", "мясо", "рыба", "морепродукты"]:
-        return max(1, int(product.storage_duration * 2 / 3))
+        return max(1, int(storage_duration_days * 2 / 3))
 
     # Для остальных товаров - до 70% срока хранения
-    return max(1, int(product.storage_duration * 0.7))
+    return max(1, int(storage_duration_days * 0.7))
 
 
 def calculate_store_price(warehouse_item, base_price, category) -> float:
@@ -58,10 +66,16 @@ def calculate_store_price(warehouse_item, base_price, category) -> float:
         return 0
 
     product = warehouse_item.product
-    storage_duration = product.storage_duration or 30  # По умолчанию 30 дней
+
+    # Convert storage_duration to days based on type
+    storage_duration_days = product.storage_duration or 30  # По умолчанию 30 дней
+    if product.storage_duration_type == StorageDurationType.MONTH:
+        storage_duration_days = storage_duration_days * 30
+    elif product.storage_duration_type == StorageDurationType.YEAR:
+        storage_duration_days = storage_duration_days * 365
 
     # Рассчитываем процент оставшегося срока годности
-    shelf_life_remaining = days_until_expiry / storage_duration
+    shelf_life_remaining = days_until_expiry / storage_duration_days
 
     # Корректируем наценку в зависимости от оставшегося срока годности
     if shelf_life_remaining > 0.8:  # Более 80% срока годности осталось
@@ -92,10 +106,16 @@ def suggest_discount(warehouse_item, store_price, base_price, category) -> Optio
         return None
 
     product = warehouse_item.product
-    storage_duration = product.storage_duration or 30  # По умолчанию, если не указано
+
+    # Convert storage_duration to days based on type
+    storage_duration_days = product.storage_duration or 30  # По умолчанию, если не указано
+    if product.storage_duration_type == StorageDurationType.MONTH:
+        storage_duration_days = storage_duration_days * 30
+    elif product.storage_duration_type == StorageDurationType.YEAR:
+        storage_duration_days = storage_duration_days * 365
 
     # Не предлагаем скидку, если осталось много времени
-    if days_until_expiry > storage_duration * 0.3:
+    if days_until_expiry > storage_duration_days * 0.3:
         return None
 
     # Рассчитываем скидку на основе оставшегося срока годности
@@ -103,7 +123,7 @@ def suggest_discount(warehouse_item, store_price, base_price, category) -> Optio
         discount_percent = 50  # 50% скидка для скоро истекающих товаров
     elif days_until_expiry <= 5:  # 5 дней или меньше
         discount_percent = 30  # 30% скидка для товаров с истекающим сроком
-    elif days_until_expiry <= storage_duration * 0.2:  # Осталось меньше 20% срока
+    elif days_until_expiry <= storage_duration_days * 0.2:  # Осталось меньше 20% срока
         discount_percent = 20  # 20% скидка
     else:  # Осталось меньше 30% срока
         discount_percent = 10  # 10% скидка
@@ -141,7 +161,13 @@ def suggest_warehouse_action(warehouse_item, category) -> Optional[Dict[str, Any
     days_in_warehouse = (today - warehouse_item.received_at).days
 
     product = warehouse_item.product
-    storage_duration = product.storage_duration or 30  # По умолчанию
+
+    # Convert storage_duration to days based on type
+    storage_duration_days = product.storage_duration or 30  # По умолчанию
+    if product.storage_duration_type == StorageDurationType.MONTH:
+        storage_duration_days = storage_duration_days * 30
+    elif product.storage_duration_type == StorageDurationType.YEAR:
+        storage_duration_days = storage_duration_days * 365
 
     # Рассчитываем максимальный срок хранения на складе
     stay_limit = calculate_warehouse_stay_limit(product, category)

@@ -126,19 +126,35 @@ async def metrics():
     )
 
 
-# Инициализация соединения с Redis при запуске
 @app.on_event("startup")
 async def startup_db_client():
-    logger.info("Connecting to Redis...")
+    logger.info(f"Connecting to Redis at {settings.REDIS_HOST}:{settings.REDIS_PORT}...")
     redis_url = f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}"
     if settings.REDIS_PASSWORD:
         redis_url = f"redis://:{settings.REDIS_PASSWORD}@{settings.REDIS_HOST}:{settings.REDIS_PORT}"
 
-    app.state.redis = await aioredis.from_url(
-        redis_url,
-        decode_responses=True
-    )
-    logger.info("Connected to Redis")
+    try:
+        app.state.redis = await aioredis.from_url(
+            redis_url,
+            decode_responses=True
+        )
+        # Проверяем соединение
+        await app.state.redis.ping()
+        logger.info("Connected to Redis")
+    except Exception as e:
+        logger.error(f"Failed to connect to Redis: {str(e)}")
+        logger.error("Make sure Redis is running and accessible:")
+        logger.error(f"- Host: {settings.REDIS_HOST}")
+        logger.error(f"- Port: {settings.REDIS_PORT}")
+        logger.error("If running locally (not in Docker), set REDIS_HOST=localhost in .env file")
+
+        # Продолжаем запуск без Redis в режиме разработки
+        if app.debug:
+            logger.warning("Continuing startup without Redis in development mode")
+            app.state.redis = None
+        else:
+            # В продакшене лучше завершить запуск с ошибкой
+            raise e
 
 
 @app.on_event("shutdown")

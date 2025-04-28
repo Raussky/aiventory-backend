@@ -9,6 +9,11 @@ class Currency(str, Enum):
     EUR = "eur"
     RUB = "rub"
 
+class StorageDurationType(str, Enum):
+    DAY = "day"
+    MONTH = "month"
+    YEAR = "year"
+
 class CategoryBase(BaseModel):
     name: str
 
@@ -29,6 +34,7 @@ class ProductBase(BaseModel):
     default_price: Optional[float] = None
     currency: Optional[Currency] = Currency.KZT
     storage_duration: Optional[int] = 30
+    storage_duration_type: Optional[StorageDurationType] = StorageDurationType.DAY
 
 class ProductCreate(ProductBase):
     pass
