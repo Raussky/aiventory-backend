@@ -58,24 +58,7 @@ class PredictionService:
 
             if not rows:
                 logger.warning(f"No sales data found for product {product_sid}")
-                return pd.DataFrame(columns=["ds", "y", "product_name", "category_name"])
-
-            df = pd.DataFrame(rows, columns=["ds", "y", "product_name", "category_name"])
-            df['ds'] = pd.to_datetime(df['ds'])
-
-            # Fill missing dates with zeros
-            date_range = pd.date_range(
-                start=df['ds'].min() if not df.empty else min_date,
-                end=datetime.now().date(),
-                freq='D'
-            )
-
-            all_dates = pd.DataFrame({'ds': date_range})
-            if not df.empty:
-                product_name = df['product_name'].iloc[0]
-                category_name = df['category_name'].iloc[0]
-            else:
-                # Get product and category names from the database
+                # Get product and category names separately
                 prod_query = text("""
                     SELECT p.name as product_name, c.name as category_name
                     FROM product p
@@ -84,6 +67,7 @@ class PredictionService:
                 """)
                 prod_result = await self.db.execute(prod_query, {"product_sid": product_sid})
                 prod_row = prod_result.fetchone()
+
                 if prod_row:
                     product_name = prod_row.product_name
                     category_name = prod_row.category_name
@@ -91,20 +75,71 @@ class PredictionService:
                     product_name = "Unknown"
                     category_name = "Unknown"
 
-            all_dates['product_name'] = product_name
-            all_dates['category_name'] = category_name
+                # Create an empty DataFrame with the right columns
+                df = pd.DataFrame(columns=["ds", "y", "product_name", "category_name"])
 
-            merged_df = pd.merge(all_dates, df, on='ds', how='left')
-            merged_df['y'] = merged_df['y_y'].fillna(0)
-            merged_df.drop(['product_name_y', 'category_name_y', 'y_y'], axis=1, errors='ignore', inplace=True)
-            merged_df.rename(columns={'product_name_x': 'product_name', 'category_name_x': 'category_name'},
-                             inplace=True)
+                # Create date range for the empty DataFrame
+                date_range = pd.date_range(
+                    start=min_date,
+                    end=datetime.now().date(),
+                    freq='D'
+                )
+
+                # Fill with zeros
+                empty_data = []
+                for single_date in date_range:
+                    empty_data.append({
+                        "ds": single_date,
+                        "y": 0.0,
+                        "product_name": product_name,
+                        "category_name": category_name
+                    })
+
+                if empty_data:
+                    df = pd.DataFrame(empty_data)
+
+                return df
+
+            # Create DataFrame directly from rows
+            df = pd.DataFrame([
+                {
+                    "ds": row.ds,
+                    "y": float(row.y),
+                    "product_name": row.product_name,
+                    "category_name": row.category_name
+                } for row in rows
+            ])
+
+            # Convert date column
+            df['ds'] = pd.to_datetime(df['ds'])
+
+            # Keep a copy of product and category names
+            product_name = df['product_name'].iloc[0]
+            category_name = df['category_name'].iloc[0]
+
+            # Get complete date range
+            date_range = pd.date_range(
+                start=df['ds'].min(),
+                end=datetime.now().date(),
+                freq='D'
+            )
+
+            # Create a complete date DataFrame
+            date_df = pd.DataFrame({"ds": date_range})
+
+            # Merge with original data
+            merged_df = pd.merge(date_df, df, on='ds', how='left')
+
+            # Fill missing values
+            merged_df['y'] = merged_df['y'].fillna(0)
+            merged_df['product_name'] = merged_df['product_name'].fillna(product_name)
+            merged_df['category_name'] = merged_df['category_name'].fillna(category_name)
 
             return merged_df
 
         except Exception as e:
             logger.error(f"Error getting sales data: {str(e)}")
-            return pd.DataFrame(columns=["ds", "y", "product_name", "category_name"])
+            raise
 
     async def get_category_seasonality(self, category_sid: str) -> Dict[str, Any]:
         """Get seasonal patterns for a category"""
@@ -144,7 +179,13 @@ class PredictionService:
                 }
 
             # Convert to dataframe
-            df = pd.DataFrame(rows, columns=["day_of_week", "month", "avg_quantity"])
+            df = pd.DataFrame([
+                {
+                    "day_of_week": float(row.day_of_week),
+                    "month": float(row.month),
+                    "avg_quantity": float(row.avg_quantity)
+                } for row in rows
+            ])
 
             # Calculate daily seasonality
             daily_seasonality = df.groupby('day_of_week')['avg_quantity'].mean().to_dict()
@@ -153,8 +194,15 @@ class PredictionService:
             monthly_seasonality = df.groupby('month')['avg_quantity'].mean().to_dict()
 
             # Determine if product has strong seasonality
-            daily_variation = np.std(list(daily_seasonality.values())) / np.mean(list(daily_seasonality.values()))
-            monthly_variation = np.std(list(monthly_seasonality.values())) / np.mean(list(monthly_seasonality.values()))
+            daily_values = list(daily_seasonality.values())
+            monthly_values = list(monthly_seasonality.values())
+
+            if daily_values and monthly_values:
+                daily_variation = np.std(daily_values) / np.mean(daily_values)
+                monthly_variation = np.std(monthly_values) / np.mean(monthly_values)
+            else:
+                daily_variation = 0
+                monthly_variation = 0
 
             return {
                 "day_of_week": {int(k): float(v) for k, v in daily_seasonality.items()},
@@ -542,12 +590,19 @@ class PredictionService:
                     "trend": "stable"
                 }
 
-            df = pd.DataFrame(rows, columns=["date", "quantity", "revenue", "product_count"])
+            df = pd.DataFrame([
+                {
+                    "date": row.date,
+                    "quantity": float(row.quantity),
+                    "revenue": float(row.revenue),
+                    "product_count": int(row.product_count)
+                } for row in rows
+            ])
 
             # Convert date to string format for JSON
             dates = [d.strftime("%Y-%m-%d") for d in df["date"]]
-            quantities = [float(q) for q in df["quantity"]]
-            revenues = [float(r) for r in df["revenue"]]
+            quantities = df["quantity"].tolist()
+            revenues = df["revenue"].tolist()
 
             # Calculate growth rates
             if len(df) >= 2:
@@ -591,8 +646,8 @@ class PredictionService:
                 "quantities": quantities,
                 "revenues": revenues,
                 "growth": {
-                    "quantity": round(float(qty_growth), 2),
-                    "revenue": round(float(rev_growth), 2)
+                    "quantity": round(float(qty_growth), 2) if 'qty_growth' in locals() else 0,
+                    "revenue": round(float(rev_growth), 2) if 'rev_growth' in locals() else 0
                 },
                 "trend": trend
             }
@@ -630,11 +685,22 @@ class PredictionService:
 
         await self.db.commit()
 
-        # Update objects after commit
-        for prediction in prediction_objects:
-            await self.db.refresh(prediction)
+        # Explicitly remove the relationship needing greenlet by creating new objects
+        result_predictions = []
+        for pred in prediction_objects:
+            await self.db.refresh(pred)
+            result_predictions.append(Prediction(
+                sid=pred.sid,
+                product_sid=pred.product_sid,
+                timeframe=pred.timeframe,
+                period_start=pred.period_start,
+                period_end=pred.period_end,
+                forecast_qty=pred.forecast_qty,
+                generated_at=pred.generated_at,
+                model_version=pred.model_version
+            ))
 
-        return prediction_objects
+        return result_predictions
 
     async def get_product_analytics(self, product_sid: str) -> Dict[str, Any]:
         """Get comprehensive analytics for a specific product"""
@@ -763,14 +829,14 @@ class PredictionService:
                 if store_data and store_data.store_quantity:
                     turnover_rate = avg_monthly_sales / float(store_data.store_quantity)
                     days_of_supply = float(store_data.store_quantity) / (
-                                avg_monthly_sales / 30) if avg_monthly_sales > 0 else 0
+                            avg_monthly_sales / 30) if avg_monthly_sales > 0 else 0
                 else:
                     turnover_rate = 0
                     days_of_supply = 0
 
                 if inventory_data and inventory_data.warehouse_quantity:
                     warehouse_days_supply = float(inventory_data.warehouse_quantity) / (
-                                avg_monthly_sales / 30) if avg_monthly_sales > 0 else 0
+                            avg_monthly_sales / 30) if avg_monthly_sales > 0 else 0
                 else:
                     warehouse_days_supply = 0
             else:
@@ -854,11 +920,11 @@ class PredictionService:
                     for f in forecasts
                 ],
                 "kpis": {
-                    "avg_monthly_sales": float(avg_monthly_sales),
-                    "avg_monthly_revenue": float(avg_monthly_revenue),
-                    "turnover_rate": float(turnover_rate),
-                    "days_of_supply": float(days_of_supply),
-                    "warehouse_days_supply": float(warehouse_days_supply)
+                    "avg_monthly_sales": float(avg_monthly_sales) if 'avg_monthly_sales' in locals() else 0,
+                    "avg_monthly_revenue": float(avg_monthly_revenue) if 'avg_monthly_revenue' in locals() else 0,
+                    "turnover_rate": float(turnover_rate) if 'turnover_rate' in locals() else 0,
+                    "days_of_supply": float(days_of_supply) if 'days_of_supply' in locals() else 0,
+                    "warehouse_days_supply": float(warehouse_days_supply) if 'warehouse_days_supply' in locals() else 0
                 },
                 "category_comparison": category_comparison
             }
