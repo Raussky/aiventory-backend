@@ -517,6 +517,10 @@ class PredictionService:
             # Generate random forecast values
             base_qty = float(np.random.randint(50, 150))
 
+            # Calculate lower and upper bounds (70% - 130% of base value)
+            forecast_qty_lower = base_qty * 0.7
+            forecast_qty_upper = base_qty * 1.3
+
             results.append({
                 "product_sid": product_sid,
                 "product_name": product_name,
@@ -525,8 +529,8 @@ class PredictionService:
                 "period_start": period_start,
                 "period_end": period_end,
                 "forecast_qty": base_qty,
-                "forecast_qty_lower": max(0, base_qty * 0.7),
-                "forecast_qty_upper": base_qty * 1.3,
+                "forecast_qty_lower": forecast_qty_lower,
+                "forecast_qty_upper": forecast_qty_upper,
                 "generated_at": datetime.now(),
                 "model_version": f"{self.model_version} (placeholder)"
             })
@@ -666,10 +670,11 @@ class PredictionService:
             }
 
     async def save_forecast(self, forecasts: List[Dict[str, Any]]) -> List[Prediction]:
-        """Saves forecasts to the database"""
+        """Saves forecasts to the database and returns detached prediction objects"""
         prediction_objects = []
 
         for forecast in forecasts:
+            # Extract the necessary fields
             prediction = Prediction(
                 sid=Base.generate_sid(),
                 product_sid=forecast["product_sid"],
@@ -681,24 +686,37 @@ class PredictionService:
                 model_version=forecast["model_version"]
             )
             self.db.add(prediction)
-            prediction_objects.append(prediction)
+            prediction_objects.append({
+                "db_obj": prediction,
+                "forecast_qty_lower": forecast.get("forecast_qty_lower"),
+                "forecast_qty_upper": forecast.get("forecast_qty_upper")
+            })
 
         await self.db.commit()
 
-        # Explicitly remove the relationship needing greenlet by creating new objects
+        # Create detached prediction objects with added properties
         result_predictions = []
-        for pred in prediction_objects:
+        for pred_info in prediction_objects:
+            pred = pred_info["db_obj"]
             await self.db.refresh(pred)
-            result_predictions.append(Prediction(
-                sid=pred.sid,
-                product_sid=pred.product_sid,
-                timeframe=pred.timeframe,
-                period_start=pred.period_start,
-                period_end=pred.period_end,
-                forecast_qty=pred.forecast_qty,
-                generated_at=pred.generated_at,
-                model_version=pred.model_version
-            ))
+
+            # Create a detached dictionary with all needed fields
+            prediction_dict = {
+                "sid": pred.sid,
+                "product_sid": pred.product_sid,
+                "timeframe": pred.timeframe,
+                "period_start": pred.period_start,
+                "period_end": pred.period_end,
+                "forecast_qty": pred.forecast_qty,
+                "generated_at": pred.generated_at,
+                "model_version": pred.model_version,
+                "product": None,  # Will be set by the ORM or API if needed
+                "forecast_qty_lower": pred_info["forecast_qty_lower"],
+                "forecast_qty_upper": pred_info["forecast_qty_upper"]
+            }
+
+            # Create a new prediction object
+            result_predictions.append(prediction_dict)
 
         return result_predictions
 
