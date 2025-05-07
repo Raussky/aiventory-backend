@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, validator
-from typing import Optional, List, Union
+from typing import Optional, List, Union, Dict, Any
 from datetime import date, datetime
 from enum import Enum
 
@@ -72,6 +72,9 @@ class WarehouseItemResponse(WarehouseItemBase):
     upload_sid: str
     status: WarehouseItemStatus
     product: ProductResponse
+    suggested_price: Optional[float] = None
+    discount_suggestion: Optional[Dict[str, Any]] = None
+    warehouse_action: Optional[Dict[str, Any]] = None
 
     class Config:
         from_attributes = True
