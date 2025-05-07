@@ -6,34 +6,94 @@ from fastapi import HTTPException
 from io import BytesIO
 from PIL import Image
 from typing import Optional, Dict, Any
+import logging
+
+# Настройка логирования для отладки
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 async def decode_barcode_from_base64(base64_image: str) -> str:
     """Декодирует штрих-код из base64-изображения"""
     try:
-        # Декодируем base64 в изображение
-        image_data = base64.b64decode(base64_image.split(',')[1] if ',' in base64_image else base64_image)
-        image = Image.open(BytesIO(image_data))
+        # Проверяем, что base64_image не пустой
+        if not base64_image:
+            logger.error("Пустое base64-изображение")
+            raise HTTPException(status_code=400, detail="Empty base64 image provided")
+
+        # Логируем размер изображения
+        logger.info(f"Размер base64-строки: {len(base64_image)} символов")
+
+        try:
+            # Декодируем base64 в изображение
+            if ',' in base64_image:
+                logger.info("Найден разделитель в base64")
+                base64_part = base64_image.split(',')[1]
+            else:
+                base64_part = base64_image
+
+            image_data = base64.b64decode(base64_part)
+            logger.info(f"Размер декодированных данных: {len(image_data)} байт")
+
+            image = Image.open(BytesIO(image_data))
+            logger.info(f"Изображение открыто. Размер: {image.size}, формат: {image.format}")
+        except Exception as e:
+            logger.error(f"Ошибка при декодировании base64: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Invalid base64 image: {str(e)}")
 
         # Конвертируем PIL Image в numpy array для OpenCV
         image_np = np.array(image)
+        logger.info(f"Форма массива изображения: {image_np.shape}")
 
         # Для черно-белого изображения
         if len(image_np.shape) == 2:
+            logger.info("Обрабатываем черно-белое изображение")
             gray = image_np
         # Для цветного изображения
         else:
+            logger.info("Конвертируем цветное изображение в оттенки серого")
             gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
 
+        # Пробуем улучшить контраст изображения
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+
         # Декодируем штрих-код
+        logger.info("Пытаемся декодировать штрих-код")
         decoded_objects = decode(gray)
+        logger.info(f"Найдено штрих-кодов: {len(decoded_objects)}")
 
         if not decoded_objects:
-            raise HTTPException(status_code=400, detail="No barcode found in the image")
+            # Попробуем изменить параметры изображения
+            logger.info("Штрих-код не найден, пробуем обработать изображение")
+
+            # Изменяем размер изображения
+            resized = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
+            decoded_objects = decode(resized)
+
+            if not decoded_objects:
+                # Применяем фильтр для улучшения границ
+                blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+                thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                               cv2.THRESH_BINARY, 11, 2)
+                decoded_objects = decode(thresh)
+
+                if not decoded_objects:
+                    logger.error("Штрих-код не обнаружен даже после обработки")
+                    raise HTTPException(status_code=400,
+                                        detail="No barcode found in the image. Please make sure the barcode is clear and try again.")
 
         # Возвращаем первый найденный штрих-код
-        return decoded_objects[0].data.decode('utf-8')
+        barcode_data = decoded_objects[0].data.decode('utf-8')
+        barcode_type = decoded_objects[0].type
+        logger.info(f"Успешно декодирован штрих-код типа {barcode_type}: {barcode_data}")
+
+        return barcode_data
+    except HTTPException:
+        # Пробрасываем HTTPException как есть
+        raise
     except Exception as e:
+        logger.error(f"Необработанная ошибка: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Error decoding barcode: {str(e)}")
 
 

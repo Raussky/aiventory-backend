@@ -1,16 +1,17 @@
-
+# app/api/v1/store.py
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
-from sqlalchemy import text
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 import json
 from redis.asyncio import Redis
+
 from app.db.session import get_db
 from app.db.redis import get_redis
 from app.models.users import User
-from app.models.inventory import StoreItem, StoreItemStatus, Discount, Sale, WarehouseItem
+from app.models.inventory import StoreItem, StoreItemStatus, Discount, Sale, WarehouseItem, Product
 from app.schemas.store import (
     StoreItemResponse, StoreItemCreate, DiscountCreate,
     DiscountResponse, SaleCreate, SaleResponse
@@ -20,6 +21,17 @@ from app.models.base import Base
 from app.core.dependencies import get_current_user
 
 router = APIRouter()
+
+
+# Custom JSON encoder for handling datetime objects
+class DateTimeEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        if isinstance(obj, timedelta):
+            return str(obj)
+        return super().default(obj)
+
 
 @router.get("/items", response_model=List[StoreItemResponse])
 async def get_store_items(
@@ -34,14 +46,20 @@ async def get_store_items(
     cache_key = f"store:items:{current_user.sid}:{status}:{skip}:{limit}"
 
     # Пытаемся получить из кеша
-    if cached := await redis.get(cache_key):
+    cached = await redis.get(cache_key)
+    if cached:
         return json.loads(cached)
 
-    # Формируем запрос
+    # Формируем запрос с правильной загрузкой отношений
     query = (
         select(StoreItem)
-        .join(StoreItem.warehouse_item)
-        .join(WarehouseItem.product)
+        .options(
+            selectinload(StoreItem.warehouse_item)
+            .selectinload(WarehouseItem.product)
+        )
+        .options(
+            selectinload(StoreItem.discounts)
+        )
     )
 
     if status:
@@ -56,8 +74,23 @@ async def get_store_items(
     items = result.scalars().all()
 
     # Формируем ответ
-    response = [
-        StoreItemResponse(
+    response = []
+    for item in items:
+        current_discounts = []
+        for d in item.discounts:
+            if d.starts_at <= datetime.utcnow() <= d.ends_at:
+                current_discounts.append(
+                    DiscountResponse(
+                        sid=d.sid,
+                        store_item_sid=d.store_item_sid,
+                        percentage=d.percentage,
+                        starts_at=d.starts_at,
+                        ends_at=d.ends_at,
+                        created_by_sid=d.created_by_sid,
+                    )
+                )
+
+        response_item = StoreItemResponse(
             sid=item.sid,
             warehouse_item_sid=item.warehouse_item_sid,
             quantity=item.quantity,
@@ -73,24 +106,17 @@ async def get_store_items(
                 default_price=item.warehouse_item.product.default_price,
             ),
             expire_date=item.warehouse_item.expire_date,
-            current_discounts=[
-                DiscountResponse(
-                    sid=d.sid,
-                    store_item_sid=d.store_item_sid,
-                    percentage=d.percentage,
-                    starts_at=d.starts_at,
-                    ends_at=d.ends_at,
-                    created_by_sid=d.created_by_sid,
-                )
-                for d in item.discounts
-                if d.starts_at <= datetime.utcnow() <= d.ends_at
-            ]
+            current_discounts=current_discounts
         )
-        for item in items
-    ]
+        response.append(response_item)
 
-    # Кешируем результат на 5 минут
-    await redis.set(cache_key, json.dumps([r.dict() for r in response]), ex=300)
+    # Кешируем результат на 5 минут, используя custom encoder для datetime
+    response_data = [r.dict() for r in response]
+    await redis.set(
+        cache_key,
+        json.dumps(response_data, cls=DateTimeEncoder),
+        ex=300
+    )
 
     return response
 
@@ -159,6 +185,13 @@ async def mark_as_expired(
     # Проверяем существование товара
     store_item_query = await db.execute(
         select(StoreItem)
+        .options(
+            selectinload(StoreItem.warehouse_item)
+            .selectinload(WarehouseItem.product)
+        )
+        .options(
+            selectinload(StoreItem.discounts)
+        )
         .where(StoreItem.sid == store_item_sid)
     )
     store_item = store_item_query.scalar_one_or_none()
@@ -188,6 +221,13 @@ async def remove_from_store(
     # Проверяем существование товара
     store_item_query = await db.execute(
         select(StoreItem)
+        .options(
+            selectinload(StoreItem.warehouse_item)
+            .selectinload(WarehouseItem.product)
+        )
+        .options(
+            selectinload(StoreItem.discounts)
+        )
         .where(StoreItem.sid == store_item_sid)
     )
     store_item = store_item_query.scalar_one_or_none()
@@ -214,9 +254,13 @@ async def record_sale(
         redis: Redis = Depends(get_redis),
 ):
     """Регистрирует продажу товара"""
-    # Проверяем существование товара
+    # Проверяем существование товара с предзагрузкой отношений
     store_item_query = await db.execute(
         select(StoreItem)
+        .options(
+            selectinload(StoreItem.warehouse_item)
+            .selectinload(WarehouseItem.product)
+        )
         .where(
             StoreItem.sid == sale.store_item_sid,
             StoreItem.status == StoreItemStatus.ACTIVE
@@ -297,11 +341,12 @@ async def get_store_reports(
     cache_key = f"store:reports:{current_user.sid}:{start_date.date()}:{end_date.date()}"
 
     # Пытаемся получить из кеша
-    if cached := await redis.get(cache_key):
+    cached = await redis.get(cache_key)
+    if cached:
         return json.loads(cached)
 
     # Получаем данные о продажах
-    sales_query = text("""
+    sales_query = """
         SELECT 
             DATE(s.sold_at) as date,
             p.name as product_name,
@@ -321,7 +366,7 @@ async def get_store_reports(
             DATE(s.sold_at), p.name
         ORDER BY 
             date DESC, revenue DESC
-    """)
+    """
 
     sales_result = await db.execute(
         sales_query,
@@ -330,13 +375,13 @@ async def get_store_reports(
     sales_data = sales_result.fetchall()
 
     # Получаем данные о скидках
-    discounts_query = text("""
+    discounts_query = """
         SELECT 
             p.name as product_name,
             d.percentage as discount_percentage,
             d.starts_at as start_date,
             d.ends_at as end_date,
-            COUNT(s.sale_id) as sales_count,
+            COUNT(s.id) as sales_count,
             SUM(s.sold_qty) as sold_quantity,
             SUM(s.sold_qty * s.sold_price) as discounted_revenue,
             SUM(s.sold_qty * p.default_price) as regular_revenue
@@ -356,7 +401,7 @@ async def get_store_reports(
             p.name, d.percentage, d.starts_at, d.ends_at
         ORDER BY 
             d.starts_at DESC
-    """)
+    """
 
     discounts_result = await db.execute(
         discounts_query,
@@ -365,12 +410,12 @@ async def get_store_reports(
     discounts_data = discounts_result.fetchall()
 
     # Получаем данные о списаниях
-    expired_query = text("""
+    expired_query = """
         SELECT 
             p.name as product_name,
             SUM(si.quantity) as expired_quantity,
             SUM(si.quantity * si.price) as expired_value,
-            COUNT(si.store_item_id) as expired_items_count
+            COUNT(si.id) as expired_items_count
         FROM 
             storeitem si
         JOIN 
@@ -378,7 +423,7 @@ async def get_store_reports(
         JOIN 
             product p ON wi.product_sid = p.sid
         WHERE 
-            si.status = 'expired' AND
+            si.status = 'EXPIRED' AND
             (
                 si.moved_at BETWEEN :start_date AND :end_date OR
                 (wi.expire_date BETWEEN :start_date AND :end_date)
@@ -387,7 +432,7 @@ async def get_store_reports(
             p.name
         ORDER BY 
             expired_value DESC
-    """)
+    """
 
     expired_result = await db.execute(
         expired_query,
@@ -446,7 +491,11 @@ async def get_store_reports(
         }
     }
 
-    # Кешируем отчет на 30 минут
-    await redis.set(cache_key, json.dumps(report), ex=1800)
+    # Кешируем отчет на 30 минут, используя custom encoder для datetime
+    await redis.set(
+        cache_key,
+        json.dumps(report, cls=DateTimeEncoder),
+        ex=1800
+    )
 
     return report

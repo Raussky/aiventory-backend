@@ -143,6 +143,8 @@ async def get_warehouse_items(
     # Используем selectinload для eager loading связанного продукта И категории
     query = select(WarehouseItem).options(
         selectinload(WarehouseItem.product).selectinload(Product.category)
+    ).where(
+        WarehouseItem.quantity > 0  # Add filter to exclude zero quantity items
     )
 
     if upload_sid:
