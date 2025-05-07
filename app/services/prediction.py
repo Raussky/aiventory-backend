@@ -204,10 +204,14 @@ class PredictionService:
                 daily_variation = 0
                 monthly_variation = 0
 
+            # Convert numpy bool to Python bool for serialization
+            has_seasonality = bool(daily_variation > 0.2 or monthly_variation > 0.3)
+
+            # Convert any NumPy types to Python native types
             return {
                 "day_of_week": {int(k): float(v) for k, v in daily_seasonality.items()},
                 "monthly": {int(k): float(v) for k, v in monthly_seasonality.items()},
-                "has_seasonality": daily_variation > 0.2 or monthly_variation > 0.3
+                "has_seasonality": has_seasonality
             }
 
         except Exception as e:
@@ -252,7 +256,7 @@ class PredictionService:
             )
 
             # Add custom seasonality if needed
-            has_seasonality = seasonality_info.get('has_seasonality', False) if seasonality_info else False
+            has_seasonality = bool(seasonality_info.get('has_seasonality', False)) if seasonality_info else False
             if has_seasonality:
                 # Add monthly seasonality
                 model.add_seasonality(
@@ -645,13 +649,17 @@ class PredictionService:
                 rev_growth = 0
                 trend = "insufficient_data"
 
+            # Convert any NumPy types to Python native types for serialization
+            qty_growth_val = float(qty_growth) if 'qty_growth' in locals() else 0
+            rev_growth_val = float(rev_growth) if 'rev_growth' in locals() else 0
+
             return {
                 "dates": dates,
                 "quantities": quantities,
                 "revenues": revenues,
                 "growth": {
-                    "quantity": round(float(qty_growth), 2) if 'qty_growth' in locals() else 0,
-                    "revenue": round(float(rev_growth), 2) if 'rev_growth' in locals() else 0
+                    "quantity": round(qty_growth_val, 2),
+                    "revenue": round(rev_growth_val, 2)
                 },
                 "trend": trend
             }
@@ -898,30 +906,38 @@ class PredictionService:
 
             category_comparison = []
             for row in category_rows:
+                # Convert numpy bool to regular Python bool for serialization
+                is_current = bool(row.product_sid == product_sid)
+
                 category_comparison.append({
                     "product_sid": row.product_sid,
                     "product_name": row.product_name,
                     "quantity": float(row.quantity),
                     "revenue": float(row.revenue),
-                    "is_current": row.product_sid == product_sid
+                    "is_current": is_current
                 })
+
+            # Convert any possible NumPy types to Python native types for serialization
+            default_price = float(prod_data.default_price) if prod_data.default_price else 0
+            warehouse_quantity = float(
+                inventory_data.warehouse_quantity) if inventory_data and inventory_data.warehouse_quantity else 0
+            store_quantity = float(store_data.store_quantity) if store_data and store_data.store_quantity else 0
+            current_price = float(store_data.current_price) if store_data and store_data.current_price else 0
+            active_discounts = int(store_data.active_discounts) if store_data and store_data.active_discounts else 0
 
             # Return comprehensive analytics
             return {
                 "product_info": {
                     "name": prod_data.product_name,
                     "barcode": prod_data.barcode,
-                    "default_price": float(prod_data.default_price) if prod_data.default_price else 0,
+                    "default_price": default_price,
                     "category": prod_data.category_name
                 },
                 "inventory": {
-                    "warehouse_quantity": float(
-                        inventory_data.warehouse_quantity) if inventory_data and inventory_data.warehouse_quantity else 0,
-                    "store_quantity": float(
-                        store_data.store_quantity) if store_data and store_data.store_quantity else 0,
-                    "current_price": float(store_data.current_price) if store_data and store_data.current_price else 0,
-                    "active_discounts": int(
-                        store_data.active_discounts) if store_data and store_data.active_discounts else 0,
+                    "warehouse_quantity": warehouse_quantity,
+                    "store_quantity": store_quantity,
+                    "current_price": current_price,
+                    "active_discounts": active_discounts,
                     "nearest_expiry": inventory_data.nearest_expiry.strftime(
                         "%Y-%m-%d") if inventory_data and inventory_data.nearest_expiry else None
                 },
