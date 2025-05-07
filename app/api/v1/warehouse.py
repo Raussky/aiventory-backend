@@ -329,3 +329,115 @@ async def move_to_store(
 
     finally:
         await redis.delete(lock_key)
+
+@router.post("/to-store-by-barcode", response_model=Dict[str, Any])
+async def move_to_store_by_barcode(
+        barcode: str = Form(...),
+        quantity: int = Form(...),
+        price: float = Form(None),
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+        redis: Redis = Depends(get_redis),
+):
+    product_query = await db.execute(
+        select(Product).options(selectinload(Product.category)).where(Product.barcode == barcode)
+    )
+    product = product_query.scalar_one_or_none()
+
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found for this barcode")
+
+    warehouse_query = await db.execute(
+        select(WarehouseItem)
+        .options(selectinload(WarehouseItem.product).selectinload(Product.category))
+        .where(
+            WarehouseItem.product_sid == product.sid,
+            WarehouseItem.status == WarehouseItemStatus.IN_STOCK,
+            WarehouseItem.quantity >= quantity
+        )
+        .order_by(WarehouseItem.expire_date.asc())
+    )
+    warehouse_item = warehouse_query.scalar_one_or_none()
+
+    if not warehouse_item:
+        raise HTTPException(status_code=404, detail="No available items in warehouse")
+
+    lock_key = f"lock:item:{warehouse_item.sid}"
+    lock_acquired = await redis.set(lock_key, str(current_user.id), nx=True, ex=5)
+
+    if not lock_acquired:
+        raise HTTPException(
+            status_code=409,
+            detail="Another operation is in progress for this item"
+        )
+
+    try:
+        if warehouse_item.status != WarehouseItemStatus.IN_STOCK:
+            raise HTTPException(status_code=400, detail="Item is not available in stock")
+
+        if warehouse_item.quantity < quantity:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Not enough quantity available (requested: {quantity}, available: {warehouse_item.quantity})"
+            )
+
+        product = warehouse_item.product
+        category = product.category
+        base_price = product.default_price or 0
+
+        suggested_price = calculate_store_price(
+            warehouse_item=warehouse_item,
+            base_price=base_price,
+            category=category
+        )
+
+        final_price = price if price is not None else suggested_price
+
+        discount_suggestion = suggest_discount(
+            warehouse_item=warehouse_item,
+            store_price=final_price,
+            base_price=base_price,
+            category=category
+        )
+
+        warehouse_action = suggest_warehouse_action(
+            warehouse_item=warehouse_item,
+            category=category
+        )
+
+        store_item = StoreItem(
+            sid=Base.generate_sid(),
+            warehouse_item_sid=warehouse_item.sid,
+            quantity=quantity,
+            price=final_price,
+            moved_at=datetime.datetime.utcnow(),
+            status=StoreItemStatus.ACTIVE,
+        )
+        db.add(store_item)
+
+        warehouse_item.quantity -= quantity
+
+        if warehouse_item.quantity == 0:
+            warehouse_item.status = WarehouseItemStatus.MOVED
+
+        await db.commit()
+
+        response = {
+            "message": "Item moved to store successfully",
+            "store_item_sid": store_item.sid,
+            "price": final_price
+        }
+
+        if price is None:
+            response["suggested_price"] = suggested_price
+
+        if discount_suggestion:
+            response["discount_suggestion"] = discount_suggestion
+
+        if warehouse_action:
+            response["warehouse_action"] = warehouse_action
+
+        return response
+
+    finally:
+        await redis.delete(lock_key)
