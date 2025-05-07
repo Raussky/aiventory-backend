@@ -22,8 +22,6 @@ from app.core.dependencies import get_current_user
 
 router = APIRouter()
 
-
-# Custom JSON encoder for handling datetime objects
 class DateTimeEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, datetime):
@@ -31,7 +29,6 @@ class DateTimeEncoder(json.JSONEncoder):
         if isinstance(obj, timedelta):
             return str(obj)
         return super().default(obj)
-
 
 @router.get("/items", response_model=List[StoreItemResponse])
 async def get_store_items(
@@ -42,15 +39,6 @@ async def get_store_items(
         db: AsyncSession = Depends(get_db),
         redis: Redis = Depends(get_redis),
 ):
-    """Получает список товаров на витрине с возможностью фильтрации по статусу"""
-    cache_key = f"store:items:{current_user.sid}:{status}:{skip}:{limit}"
-
-    # Пытаемся получить из кеша
-    cached = await redis.get(cache_key)
-    if cached:
-        return json.loads(cached)
-
-    # Формируем запрос с правильной загрузкой отношений
     query = (
         select(StoreItem)
         .options(
@@ -65,7 +53,6 @@ async def get_store_items(
     if status:
         query = query.where(StoreItem.status == status)
 
-    # Выполняем запрос
     result = await db.execute(
         query.order_by(StoreItem.moved_at.desc())
         .offset(skip)
@@ -73,7 +60,6 @@ async def get_store_items(
     )
     items = result.scalars().all()
 
-    # Формируем ответ
     response = []
     for item in items:
         current_discounts = []
@@ -110,16 +96,7 @@ async def get_store_items(
         )
         response.append(response_item)
 
-    # Кешируем результат на 5 минут, используя custom encoder для datetime
-    response_data = [r.dict() for r in response]
-    await redis.set(
-        cache_key,
-        json.dumps(response_data, cls=DateTimeEncoder),
-        ex=300
-    )
-
     return response
-
 
 @router.post("/discount", response_model=DiscountResponse)
 async def create_discount(
@@ -128,8 +105,6 @@ async def create_discount(
         db: AsyncSession = Depends(get_db),
         redis: Redis = Depends(get_redis),
 ):
-    """Создает скидку на товар"""
-    # Проверяем существование товара
     store_item_query = await db.execute(
         select(StoreItem).where(StoreItem.sid == discount.store_item_sid)
     )
@@ -138,7 +113,6 @@ async def create_discount(
     if not store_item:
         raise HTTPException(status_code=404, detail="Store item not found")
 
-    # Проверяем на конфликты с существующими скидками
     overlapping_query = await db.execute(
         select(Discount).where(
             Discount.store_item_sid == discount.store_item_sid,
@@ -154,7 +128,6 @@ async def create_discount(
             detail="There's an overlapping discount for this time period"
         )
 
-    # Создаем скидку
     new_discount = Discount(
         sid=Base.generate_sid(),
         store_item_sid=discount.store_item_sid,
@@ -168,11 +141,9 @@ async def create_discount(
     await db.commit()
     await db.refresh(new_discount)
 
-    # Инвалидируем кеш
     await redis.delete(f"store:items:{current_user.sid}:*")
 
     return new_discount
-
 
 @router.post("/expire/{store_item_sid}", response_model=StoreItemResponse)
 async def mark_as_expired(
@@ -181,8 +152,6 @@ async def mark_as_expired(
         db: AsyncSession = Depends(get_db),
         redis: Redis = Depends(get_redis),
 ):
-    """Помечает товар как просроченный"""
-    # Проверяем существование товара
     store_item_query = await db.execute(
         select(StoreItem)
         .options(
@@ -199,16 +168,13 @@ async def mark_as_expired(
     if not store_item:
         raise HTTPException(status_code=404, detail="Store item not found")
 
-    # Обновляем статус
     store_item.status = StoreItemStatus.EXPIRED
     await db.commit()
     await db.refresh(store_item)
 
-    # Инвалидируем кеш
     await redis.delete(f"store:items:{current_user.sid}:*")
 
     return store_item
-
 
 @router.post("/remove/{store_item_sid}", response_model=StoreItemResponse)
 async def remove_from_store(
@@ -217,8 +183,6 @@ async def remove_from_store(
         db: AsyncSession = Depends(get_db),
         redis: Redis = Depends(get_redis),
 ):
-    """Удаляет товар с витрины (списание)"""
-    # Проверяем существование товара
     store_item_query = await db.execute(
         select(StoreItem)
         .options(
@@ -235,16 +199,13 @@ async def remove_from_store(
     if not store_item:
         raise HTTPException(status_code=404, detail="Store item not found")
 
-    # Обновляем статус
     store_item.status = StoreItemStatus.REMOVED
     await db.commit()
     await db.refresh(store_item)
 
-    # Инвалидируем кеш
     await redis.delete(f"store:items:{current_user.sid}:*")
 
     return store_item
-
 
 @router.post("/sales", response_model=SaleResponse)
 async def record_sale(
@@ -253,8 +214,6 @@ async def record_sale(
         db: AsyncSession = Depends(get_db),
         redis: Redis = Depends(get_redis),
 ):
-    """Регистрирует продажу товара"""
-    # Проверяем существование товара с предзагрузкой отношений
     store_item_query = await db.execute(
         select(StoreItem)
         .options(
@@ -274,14 +233,12 @@ async def record_sale(
             detail="Active store item not found"
         )
 
-    # Проверяем наличие достаточного количества
     if store_item.quantity < sale.sold_qty:
         raise HTTPException(
             status_code=400,
             detail=f"Not enough quantity available (requested: {sale.sold_qty}, available: {store_item.quantity})"
         )
 
-    # Создаем запись о продаже
     new_sale = Sale(
         sid=Base.generate_sid(),
         store_item_sid=sale.store_item_sid,
@@ -291,10 +248,8 @@ async def record_sale(
         cashier_sid=current_user.sid,
     )
 
-    # Уменьшаем количество товара на витрине
     store_item.quantity -= sale.sold_qty
 
-    # Если товара не осталось, меняем статус
     if store_item.quantity == 0:
         store_item.status = StoreItemStatus.REMOVED
 
@@ -302,10 +257,8 @@ async def record_sale(
     await db.commit()
     await db.refresh(new_sale)
 
-    # Инвалидируем кеш
     await redis.delete(f"store:items:{current_user.sid}:*")
 
-    # Публикуем событие в Redis Pub/Sub для обновления UI
     await redis.publish(
         f"sales:{current_user.sid}",
         json.dumps({
@@ -320,7 +273,6 @@ async def record_sale(
 
     return new_sale
 
-
 @router.get("/reports", response_model=Dict[str, Any])
 async def get_store_reports(
         start_date: datetime = Query(None),
@@ -329,23 +281,18 @@ async def get_store_reports(
         db: AsyncSession = Depends(get_db),
         redis: Redis = Depends(get_redis),
 ):
-    """Получает отчеты о продажах, скидках и списаниях"""
-    # Устанавливаем периоды по умолчанию, если не указаны
     if not start_date:
         start_date = datetime.utcnow() - timedelta(days=30)
 
     if not end_date:
         end_date = datetime.utcnow()
 
-    # Кеш-ключ для отчета
     cache_key = f"store:reports:{current_user.sid}:{start_date.date()}:{end_date.date()}"
 
-    # Пытаемся получить из кеша
     cached = await redis.get(cache_key)
     if cached:
         return json.loads(cached)
 
-    # Получаем данные о продажах
     sales_query = """
         SELECT 
             DATE(s.sold_at) as date,
@@ -374,7 +321,6 @@ async def get_store_reports(
     )
     sales_data = sales_result.fetchall()
 
-    # Получаем данные о скидках
     discounts_query = """
         SELECT 
             p.name as product_name,
@@ -409,7 +355,6 @@ async def get_store_reports(
     )
     discounts_data = discounts_result.fetchall()
 
-    # Получаем данные о списаниях
     expired_query = """
         SELECT 
             p.name as product_name,
@@ -440,7 +385,6 @@ async def get_store_reports(
     )
     expired_data = expired_result.fetchall()
 
-    # Формируем итоговый отчет
     report = {
         "period": {
             "start_date": start_date.isoformat(),
@@ -491,7 +435,6 @@ async def get_store_reports(
         }
     }
 
-    # Кешируем отчет на 30 минут, используя custom encoder для datetime
     await redis.set(
         cache_key,
         json.dumps(report, cls=DateTimeEncoder),
