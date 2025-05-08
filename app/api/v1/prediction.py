@@ -6,18 +6,72 @@ from sqlalchemy import text
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 import pandas as pd
+from sqlalchemy.orm import selectinload
 
 from app.db.session import get_db
 from app.models.users import User
-from app.models.inventory import Prediction, Product, TimeFrame
+from app.models.inventory import Prediction, Product, TimeFrame, Category
 from app.schemas.prediction import (
     PredictionResponse, PredictionCreate, PredictionRequest,
     PredictionStatResponse, ProductAnalyticsResponse
 )
+from app.schemas.inventory import ProductResponse, CategoryResponse
 from app.core.dependencies import get_current_user
 from app.services.prediction import PredictionService
 
 router = APIRouter()
+
+
+@router.get("/products", response_model=List[ProductResponse])
+async def get_products(
+        skip: int = 0,
+        limit: int = 100,
+        category_sid: Optional[str] = None,
+        search: Optional[str] = None,
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+):
+    """Get all products with optional filtering"""
+    query = select(Product).options(selectinload(Product.category))
+
+    if category_sid:
+        query = query.where(Product.category_sid == category_sid)
+
+    if search:
+        query = query.where(Product.name.ilike(f"%{search}%"))
+
+    result = await db.execute(
+        query.order_by(Product.name)
+        .offset(skip)
+        .limit(limit)
+    )
+    products = result.scalars().all()
+
+    return products
+
+
+@router.get("/categories", response_model=List[CategoryResponse])
+async def get_categories(
+        skip: int = 0,
+        limit: int = 100,
+        search: Optional[str] = None,
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+):
+    """Get all categories with optional filtering"""
+    query = select(Category)
+
+    if search:
+        query = query.where(Category.name.ilike(f"%{search}%"))
+
+    result = await db.execute(
+        query.order_by(Category.name)
+        .offset(skip)
+        .limit(limit)
+    )
+    categories = result.scalars().all()
+
+    return categories
 
 
 @router.get("/forecast/{product_sid}", response_model=List[PredictionResponse])
