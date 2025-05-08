@@ -5,7 +5,7 @@ from app.core.config import settings
 import logging
 from fastapi import HTTPException, status
 import asyncio
-
+from sqlalchemy import text
 logger = logging.getLogger(__name__)
 
 # Configure SQLAlchemy engine with more verbose logging
@@ -47,7 +47,7 @@ async def get_db():
                 try:
                     await asyncio.sleep(retry_delay)
                     logger.info(f"Retrying database connection (attempt {attempt + 1}/{retry_count})...")
-                    await db.execute("SELECT 1")
+                    await db.execute(text("SELECT 1"))
                     logger.info("Database connection successful after retry")
                     break
                 except Exception as retry_e:
