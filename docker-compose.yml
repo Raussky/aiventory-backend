@@ -13,7 +13,9 @@ services:
     volumes:
       - ./app:/app/app
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-  
+    environment:
+      - REDIS_HOST=redis  # Explicitly set this to the service name
+
   celery_worker:
     build: .
     env_file:
@@ -22,7 +24,9 @@ services:
       - redis
       - postgres
     command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=2
-  
+    environment:
+      - REDIS_HOST=redis  # Explicitly set this to the service name
+
   celery_beat:
     build: .
     env_file:
@@ -31,7 +35,9 @@ services:
       - redis
       - postgres
     command: celery -A app.tasks.celery_app beat --loglevel=info
-  
+    environment:
+      - REDIS_HOST=redis  # Explicitly set this to the service name
+
   postgres:
     image: postgres:14
     volumes:
@@ -39,24 +45,25 @@ services:
     env_file:
       - .env
     ports:
-      - "5432:5432"
-  
+      - "5433:5432"
+
   redis:
     image: redis:alpine
     ports:
       - "6379:6379"
-    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    command: redis-server --appendonly yes --requirepass "${REDIS_PASSWORD}"
     volumes:
       - redis_data:/data
-  
+
   nginx:
     image: nginx:latest
     ports:
       - "80:80"
-      - "443:443"
+      # Commented out SSL port until certificates are available
+      # - "443:443"
     volumes:
       - ./nginx/conf:/etc/nginx/conf.d:ro
-      - ./nginx/ssl:/etc/nginx/ssl:ro
+      # - ./nginx/ssl:/etc/nginx/ssl:ro  # Commented out until SSL certs are available
       - ./frontend/dist:/usr/share/nginx/html:ro
     depends_on:
       - api

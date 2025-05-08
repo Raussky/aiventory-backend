@@ -3,7 +3,7 @@ FROM continuumio/miniconda3:latest
 
 WORKDIR /app
 
-# Установка системных зависимостей
+# Устанавливаем системные зависимости, включая libgl1 для OpenCV
 RUN apt-get update && apt-get install -y \
     gcc \
     libpq-dev \
@@ -11,6 +11,8 @@ RUN apt-get update && apt-get install -y \
     libzbar-dev \
     curl \
     build-essential \
+    libgl1 \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Копирование зависимостей
@@ -23,7 +25,7 @@ RUN conda create -n inventory python=3.10 -y && \
     conda install -c conda-forge prophet -y && \
     pip install --no-cache-dir -r requirements.txt"
 
-# Устанавливаем переменную окружения PATH, чтобы все команды использовали python из conda
+# Устанавливаем переменную окружения PATH
 ENV PATH /opt/conda/envs/inventory/bin:$PATH
 
 # Копирование кода
