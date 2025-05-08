@@ -1,3 +1,4 @@
+# /docker-compose.yml
 version: '3.8'
 
 services:
@@ -8,35 +9,54 @@ services:
     env_file:
       - .env
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
       - ./app:/app/app
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     environment:
-      - REDIS_HOST=redis  # Explicitly set this to the service name
+      - POSTGRES_SERVER=postgres
+      - REDIS_HOST=redis
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
 
   celery_worker:
     build: .
     env_file:
       - .env
     depends_on:
-      - redis
-      - postgres
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=2
     environment:
-      - REDIS_HOST=redis  # Explicitly set this to the service name
+      - POSTGRES_SERVER=postgres
+      - REDIS_HOST=redis
+    volumes:
+      - ./app:/app/app
 
   celery_beat:
     build: .
     env_file:
       - .env
     depends_on:
-      - redis
-      - postgres
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     command: celery -A app.tasks.celery_app beat --loglevel=info
     environment:
-      - REDIS_HOST=redis  # Explicitly set this to the service name
+      - POSTGRES_SERVER=postgres
+      - REDIS_HOST=redis
+    volumes:
+      - ./app:/app/app
 
   postgres:
     image: postgres:14
@@ -46,6 +66,16 @@ services:
       - .env
     ports:
       - "5432:5432"
+    environment:
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=inventory
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   redis:
     image: redis:alpine
@@ -54,19 +84,23 @@ services:
     command: redis-server --appendonly yes --requirepass "${REDIS_PASSWORD}"
     volumes:
       - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
   nginx:
     image: nginx:latest
     ports:
       - "80:80"
-      # Commented out SSL port until certificates are available
-      # - "443:443"
     volumes:
       - ./nginx/conf:/etc/nginx/conf.d:ro
-      # - ./nginx/ssl:/etc/nginx/ssl:ro  # Commented out until SSL certs are available
       - ./frontend/dist:/usr/share/nginx/html:ro
     depends_on:
-      - api
+      api:
+        condition: service_healthy
 
 volumes:
   postgres_data:

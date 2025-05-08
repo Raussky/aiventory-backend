@@ -2,18 +2,23 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
-from aioredis import Redis
+from redis.asyncio import Redis  # Changed from aioredis to redis.asyncio
 import random
 import string
 from datetime import datetime, timedelta
 from sqlalchemy import select
+from jose import jwt, JWTError  # Added import for jose.jwt and JWTError
+import uuid  # Added for UUID generation
+
 from app.core.security import create_access_token, verify_password, get_password_hash
+from app.core.config import settings  # Added import for settings
 from app.db.session import get_db
 from app.db.redis import get_redis
 from app.models.users import User, VerificationToken
 from app.schemas.user import UserCreate, UserResponse, UserVerify, UserLogin
 from app.services.email import send_verification_email
 from app.models.base import Base
+
 router = APIRouter()
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"/api/v1/auth/login")
@@ -38,7 +43,7 @@ async def get_current_user(
 
         if user_sid is None:
             raise HTTPException(status_code=401, detail="Invalid token")
-    except jwt.JWTError:
+    except JWTError:  # Changed from jwt.JWTError to JWTError
         raise HTTPException(status_code=401, detail="Invalid token")
 
     user = await db.execute(select(User).where(User.sid == user_sid))

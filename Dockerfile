@@ -1,4 +1,4 @@
-# Dockerfile
+# /Dockerfile
 FROM continuumio/miniconda3:latest
 
 WORKDIR /app
@@ -13,6 +13,9 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     libgl1 \
     libglib2.0-0 \
+    netcat \
+    postgresql-client \
+    redis-tools \
     && rm -rf /var/lib/apt/lists/*
 
 # Копирование зависимостей
@@ -30,6 +33,11 @@ ENV PATH /opt/conda/envs/inventory/bin:$PATH
 
 # Копирование кода
 COPY . .
+
+# Используем entrypoint скрипт
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 
 # Запуск приложения через conda-окружение
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

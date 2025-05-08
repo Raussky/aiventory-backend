@@ -1,4 +1,4 @@
-# app/db/redis.py
+# /app/db/redis.py
 from redis.asyncio import Redis
 from app.core.config import settings
 import logging
@@ -46,7 +46,15 @@ async def get_redis() -> Redis:
     if not redis:
         error_msg = f"Не удалось подключиться к Redis ({settings.REDIS_HOST}:{settings.REDIS_PORT}). "
         error_msg += "Проверьте, что Redis запущен и доступен. "
-        error_msg += "Если запуск локальный (не в Docker), установите REDIS_HOST=localhost в .env файле."
+
+        # Add detailed troubleshooting information based on environment
+        if settings.REDIS_HOST == "redis":
+            error_msg += "Если запуск выполняется локально (не в Docker), установите REDIS_HOST=localhost в .env файле."
+        elif settings.REDIS_HOST == "localhost":
+            error_msg += "Если запуск выполняется в Docker, установите REDIS_HOST=redis в .env файле."
+        elif "railway.internal" in settings.REDIS_HOST:
+            error_msg += "Вы используете Railway.app - убедитесь, что сервис Redis правильно настроен в вашем проекте."
+
         logger.error(error_msg)
 
         # В режиме разработки можно продолжить без Redis с ограниченной функциональностью
@@ -55,15 +63,23 @@ async def get_redis() -> Redis:
             try:
                 # Создаем заглушку Redis для неблокирующей работы
                 class RedisMock:
-                    async def get(self, *args, **kwargs): return None
+                    async def get(self, *args, **kwargs):
+                        return None
 
-                    async def set(self, *args, **kwargs): return True
+                    async def set(self, *args, **kwargs):
+                        return True
 
-                    async def delete(self, *args, **kwargs): return True
+                    async def delete(self, *args, **kwargs):
+                        return True
 
-                    async def close(self): pass
+                    async def close(self):
+                        pass
 
-                    async def publish(self, *args, **kwargs): return 0
+                    async def publish(self, *args, **kwargs):
+                        return 0
+
+                    async def ping(self, *args, **kwargs):
+                        return True
 
                 yield RedisMock()
                 return
