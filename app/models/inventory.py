@@ -1,4 +1,3 @@
-# app/models/inventory.py
 from sqlalchemy import Column, String, Integer, Float, DateTime, Date, ForeignKey, Enum, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
@@ -8,16 +7,22 @@ from app.models.base import Base
 
 
 class Currency(str, enum.Enum):
-    KZT = "kzt"  # Tenge
-    USD = "usd"  # US Dollar
-    EUR = "eur"  # Euro
-    RUB = "rub"  # Russian Ruble
+    KZT = "kzt"
+    USD = "usd"
+    EUR = "eur"
+    RUB = "rub"
 
 
 class StorageDurationType(str, enum.Enum):
     DAY = "day"
     MONTH = "month"
     YEAR = "year"
+
+
+class UrgencyLevel(str, enum.Enum):
+    NORMAL = "normal"
+    URGENT = "urgent"
+    CRITICAL = "critical"
 
 
 class Category(Base):
@@ -33,8 +38,8 @@ class Product(Base):
     default_unit = Column(String)
     default_price = Column(Float)
     currency = Column(Enum(Currency), default=Currency.KZT)
-    storage_duration = Column(Integer, default=30)  # Storage duration value
-    storage_duration_type = Column(Enum(StorageDurationType), default=StorageDurationType.DAY)  # Storage duration type (day, month, year)
+    storage_duration = Column(Integer, default=30)
+    storage_duration_type = Column(Enum(StorageDurationType), default=StorageDurationType.DAY)
 
     warehouse_items = relationship("WarehouseItem", back_populates="product")
     predictions = relationship("Prediction", back_populates="product")
@@ -66,6 +71,7 @@ class WarehouseItem(Base):
     expire_date = Column(Date)
     received_at = Column(Date, nullable=False)
     status = Column(Enum(WarehouseItemStatus), default=WarehouseItemStatus.IN_STOCK)
+    urgency_level = Column(Enum(UrgencyLevel), default=UrgencyLevel.NORMAL)
 
     store_items = relationship("StoreItem", back_populates="warehouse_item")
 

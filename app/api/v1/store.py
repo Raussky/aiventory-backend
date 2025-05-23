@@ -1,4 +1,3 @@
-# app/api/v1/store.py
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -11,7 +10,7 @@ from redis.asyncio import Redis
 from app.db.session import get_db
 from app.db.redis import get_redis
 from app.models.users import User
-from app.models.inventory import StoreItem, StoreItemStatus, Discount, Sale, WarehouseItem, Product
+from app.models.inventory import StoreItem, StoreItemStatus, Discount, Sale, WarehouseItem, Product, Upload
 from app.schemas.store import (
     StoreItemResponse, StoreItemCreate, DiscountCreate,
     DiscountResponse, SaleCreate, SaleResponse
@@ -44,10 +43,14 @@ async def get_store_items(
         .options(
             selectinload(StoreItem.warehouse_item)
             .selectinload(WarehouseItem.product)
-        )
-        .options(
+            .selectinload(Product.category),
+            selectinload(StoreItem.warehouse_item)
+            .selectinload(WarehouseItem.upload),
             selectinload(StoreItem.discounts)
         )
+        .join(WarehouseItem)
+        .join(Upload)
+        .where(Upload.user_sid == current_user.sid)
     )
 
     if status:
@@ -106,7 +109,13 @@ async def create_discount(
         redis: Redis = Depends(get_redis),
 ):
     store_item_query = await db.execute(
-        select(StoreItem).where(StoreItem.sid == discount.store_item_sid)
+        select(StoreItem)
+        .join(WarehouseItem)
+        .join(Upload)
+        .where(
+            StoreItem.sid == discount.store_item_sid,
+            Upload.user_sid == current_user.sid
+        )
     )
     store_item = store_item_query.scalar_one_or_none()
 
@@ -156,12 +165,17 @@ async def mark_as_expired(
         select(StoreItem)
         .options(
             selectinload(StoreItem.warehouse_item)
-            .selectinload(WarehouseItem.product)
-        )
-        .options(
+            .selectinload(WarehouseItem.product),
+            selectinload(StoreItem.warehouse_item)
+            .selectinload(WarehouseItem.upload),
             selectinload(StoreItem.discounts)
         )
-        .where(StoreItem.sid == store_item_sid)
+        .join(WarehouseItem)
+        .join(Upload)
+        .where(
+            StoreItem.sid == store_item_sid,
+            Upload.user_sid == current_user.sid
+        )
     )
     store_item = store_item_query.scalar_one_or_none()
 
@@ -187,12 +201,17 @@ async def remove_from_store(
         select(StoreItem)
         .options(
             selectinload(StoreItem.warehouse_item)
-            .selectinload(WarehouseItem.product)
-        )
-        .options(
+            .selectinload(WarehouseItem.product),
+            selectinload(StoreItem.warehouse_item)
+            .selectinload(WarehouseItem.upload),
             selectinload(StoreItem.discounts)
         )
-        .where(StoreItem.sid == store_item_sid)
+        .join(WarehouseItem)
+        .join(Upload)
+        .where(
+            StoreItem.sid == store_item_sid,
+            Upload.user_sid == current_user.sid
+        )
     )
     store_item = store_item_query.scalar_one_or_none()
 
@@ -220,9 +239,12 @@ async def record_sale(
             selectinload(StoreItem.warehouse_item)
             .selectinload(WarehouseItem.product)
         )
+        .join(WarehouseItem)
+        .join(Upload)
         .where(
             StoreItem.sid == sale.store_item_sid,
-            StoreItem.status == StoreItemStatus.ACTIVE
+            StoreItem.status == StoreItemStatus.ACTIVE,
+            Upload.user_sid == current_user.sid
         )
     )
     store_item = store_item_query.scalar_one_or_none()
@@ -307,8 +329,11 @@ async def get_store_reports(
             warehouseitem wi ON si.warehouse_item_sid = wi.sid
         JOIN 
             product p ON wi.product_sid = p.sid
+        JOIN
+            upload u ON wi.upload_sid = u.sid
         WHERE 
             s.sold_at BETWEEN :start_date AND :end_date
+            AND u.user_sid = :user_sid
         GROUP BY 
             DATE(s.sold_at), p.name
         ORDER BY 
@@ -317,7 +342,7 @@ async def get_store_reports(
 
     sales_result = await db.execute(
         sales_query,
-        {"start_date": start_date, "end_date": end_date}
+        {"start_date": start_date, "end_date": end_date, "user_sid": current_user.sid}
     )
     sales_data = sales_result.fetchall()
 
@@ -339,10 +364,13 @@ async def get_store_reports(
             warehouseitem wi ON si.warehouse_item_sid = wi.sid
         JOIN 
             product p ON wi.product_sid = p.sid
+        JOIN
+            upload u ON wi.upload_sid = u.sid
         LEFT JOIN 
             sale s ON si.sid = s.store_item_sid AND s.sold_at BETWEEN d.starts_at AND d.ends_at
         WHERE 
             d.starts_at <= :end_date AND d.ends_at >= :start_date
+            AND u.user_sid = :user_sid
         GROUP BY 
             p.name, d.percentage, d.starts_at, d.ends_at
         ORDER BY 
@@ -351,7 +379,7 @@ async def get_store_reports(
 
     discounts_result = await db.execute(
         discounts_query,
-        {"start_date": start_date, "end_date": end_date}
+        {"start_date": start_date, "end_date": end_date, "user_sid": current_user.sid}
     )
     discounts_data = discounts_result.fetchall()
 
@@ -367,8 +395,11 @@ async def get_store_reports(
             warehouseitem wi ON si.warehouse_item_sid = wi.sid
         JOIN 
             product p ON wi.product_sid = p.sid
+        JOIN
+            upload u ON wi.upload_sid = u.sid
         WHERE 
             si.status = 'EXPIRED' AND
+            u.user_sid = :user_sid AND
             (
                 si.moved_at BETWEEN :start_date AND :end_date OR
                 (wi.expire_date BETWEEN :start_date AND :end_date)
@@ -381,7 +412,7 @@ async def get_store_reports(
 
     expired_result = await db.execute(
         expired_query,
-        {"start_date": start_date, "end_date": end_date}
+        {"start_date": start_date, "end_date": end_date, "user_sid": current_user.sid}
     )
     expired_data = expired_result.fetchall()
 

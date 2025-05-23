@@ -8,7 +8,7 @@ import datetime
 from app.db.session import get_db
 from app.models.users import User
 from app.models.inventory import Product, Category, Upload, WarehouseItem, WarehouseItemStatus, StoreItem, \
-    StoreItemStatus, Currency, StorageDurationType
+    StoreItemStatus, Currency, StorageDurationType, UrgencyLevel
 from app.models.base import Base
 from app.schemas.inventory import (
     WarehouseItemResponse, UploadResponse, WarehouseItemCreate
@@ -60,6 +60,8 @@ async def upload_file(
                 await db.refresh(category)
 
             product_name = record.get('name')
+            barcode = str(record.get('barcode')) if record.get('barcode') is not None else None
+
             product_query = await db.execute(
                 select(Product).where(
                     (Product.name == product_name) &
@@ -83,7 +85,7 @@ async def upload_file(
                     sid=Base.generate_sid(),
                     category_sid=category.sid,
                     name=product_name,
-                    barcode=str(record.get('barcode')) if record.get('barcode') is not None else None,
+                    barcode=barcode,
                     default_unit=record.get('unit'),
                     default_price=float(record.get('price')) if record.get('price') is not None else None,
                     currency=Currency.KZT,
@@ -93,6 +95,33 @@ async def upload_file(
                 db.add(product)
                 await db.commit()
                 await db.refresh(product)
+
+            if barcode and product.barcode:
+                existing_items_query = await db.execute(
+                    select(WarehouseItem)
+                    .join(Upload)
+                    .join(Product)
+                    .where(
+                        Product.barcode == barcode,
+                        WarehouseItem.status == WarehouseItemStatus.IN_STOCK,
+                        Upload.user_sid == current_user.sid,
+                        WarehouseItem.quantity > 0
+                    )
+                    .order_by(WarehouseItem.expire_date.asc())
+                )
+                existing_items = existing_items_query.scalars().all()
+
+                for existing_item in existing_items:
+                    if existing_item.expire_date:
+                        days_until_expiry = (existing_item.expire_date - datetime.date.today()).days
+                        if days_until_expiry <= 7:
+                            existing_item.urgency_level = UrgencyLevel.CRITICAL
+                        elif days_until_expiry <= 14:
+                            existing_item.urgency_level = UrgencyLevel.URGENT
+                        else:
+                            existing_item.urgency_level = UrgencyLevel.URGENT
+                    else:
+                        existing_item.urgency_level = UrgencyLevel.URGENT
 
             expire_date = None
             if record.get('expire_date'):
@@ -117,6 +146,7 @@ async def upload_file(
                 expire_date=expire_date,
                 received_at=received_at,
                 status=WarehouseItemStatus.IN_STOCK,
+                urgency_level=UrgencyLevel.NORMAL,
             )
             db.add(warehouse_item)
 
@@ -138,12 +168,15 @@ async def get_warehouse_items(
         limit: int = 100,
         upload_sid: Optional[str] = None,
         expire_soon: bool = False,
+        urgency_level: Optional[UrgencyLevel] = None,
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
 ):
     query = select(WarehouseItem).options(
-        selectinload(WarehouseItem.product).selectinload(Product.category)
-    ).where(
+        selectinload(WarehouseItem.product).selectinload(Product.category),
+        selectinload(WarehouseItem.upload)
+    ).join(Upload).where(
+        Upload.user_sid == current_user.sid,
         WarehouseItem.quantity > 0
     )
 
@@ -158,8 +191,12 @@ async def get_warehouse_items(
             WarehouseItem.status == WarehouseItemStatus.IN_STOCK
         )
 
+    if urgency_level:
+        query = query.where(WarehouseItem.urgency_level == urgency_level)
+
     result = await db.execute(
-        query.order_by(WarehouseItem.received_at.desc())
+        query.order_by(WarehouseItem.urgency_level.desc(), WarehouseItem.expire_date.asc(),
+                       WarehouseItem.received_at.desc())
         .offset(skip)
         .limit(limit)
     )
@@ -198,6 +235,7 @@ async def get_warehouse_items(
             expire_date=item.expire_date,
             received_at=item.received_at,
             status=item.status,
+            urgency_level=item.urgency_level,
             product=item.product,
             suggested_price=suggested_price,
             discount_suggestion=discount_suggestion,
@@ -237,12 +275,14 @@ async def move_to_store(
 
         warehouse_query = await db.execute(
             select(WarehouseItem)
+            .join(Upload)
             .where(
                 WarehouseItem.product_sid == product.sid,
                 WarehouseItem.status == WarehouseItemStatus.IN_STOCK,
-                WarehouseItem.quantity >= quantity
+                WarehouseItem.quantity >= quantity,
+                Upload.user_sid == current_user.sid
             )
-            .order_by(WarehouseItem.expire_date.asc())
+            .order_by(WarehouseItem.urgency_level.desc(), WarehouseItem.expire_date.asc())
         )
         warehouse_item = warehouse_query.scalar_one_or_none()
 
@@ -264,7 +304,11 @@ async def move_to_store(
         warehouse_query = await db.execute(
             select(WarehouseItem)
             .options(selectinload(WarehouseItem.product).selectinload(Product.category))
-            .where(WarehouseItem.sid == item_sid)
+            .join(Upload)
+            .where(
+                WarehouseItem.sid == item_sid,
+                Upload.user_sid == current_user.sid
+            )
         )
         warehouse_item = warehouse_query.scalar_one_or_none()
 
@@ -319,6 +363,9 @@ async def move_to_store(
         if warehouse_item.quantity == 0:
             warehouse_item.status = WarehouseItemStatus.MOVED
 
+        if warehouse_item.urgency_level != UrgencyLevel.NORMAL:
+            warehouse_item.urgency_level = UrgencyLevel.NORMAL
+
         await db.commit()
 
         response = {
@@ -370,12 +417,14 @@ async def move_to_store_by_barcode(
     warehouse_query = await db.execute(
         select(WarehouseItem)
         .options(selectinload(WarehouseItem.product).selectinload(Product.category))
+        .join(Upload)
         .where(
             WarehouseItem.product_sid == product.sid,
             WarehouseItem.status == WarehouseItemStatus.IN_STOCK,
-            WarehouseItem.quantity >= quantity
+            WarehouseItem.quantity >= quantity,
+            Upload.user_sid == current_user.sid
         )
-        .order_by(WarehouseItem.expire_date.asc())
+        .order_by(WarehouseItem.urgency_level.desc(), WarehouseItem.expire_date.asc())
     )
     warehouse_item = warehouse_query.scalar_one_or_none()
 
@@ -440,6 +489,9 @@ async def move_to_store_by_barcode(
         if warehouse_item.quantity == 0:
             warehouse_item.status = WarehouseItemStatus.MOVED
 
+        if warehouse_item.urgency_level != UrgencyLevel.NORMAL:
+            warehouse_item.urgency_level = UrgencyLevel.NORMAL
+
         await db.commit()
 
         response = {
@@ -448,7 +500,8 @@ async def move_to_store_by_barcode(
             "price": final_price,
             "product_name": product.name,
             "category": category.name,
-            "expire_date": warehouse_item.expire_date.isoformat() if warehouse_item.expire_date else None
+            "expire_date": warehouse_item.expire_date.isoformat() if warehouse_item.expire_date else None,
+            "was_urgent": warehouse_item.urgency_level != UrgencyLevel.NORMAL
         }
 
         if price is None:
