@@ -2,13 +2,13 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, s
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import datetime
 
 from app.db.session import get_db
 from app.models.users import User
 from app.models.inventory import Product, Category, Upload, WarehouseItem, WarehouseItemStatus, StoreItem, \
-    StoreItemStatus, Currency
+    StoreItemStatus, Currency, StorageDurationType
 from app.models.base import Base
 from app.schemas.inventory import (
     WarehouseItemResponse, UploadResponse, WarehouseItemCreate
@@ -69,6 +69,16 @@ async def upload_file(
             product = product_query.scalar_one_or_none()
 
             if not product:
+                storage_duration = int(record.get('storage_duration', 30))
+                storage_duration_type_str = record.get('storage_duration_type', 'day').lower()
+
+                if storage_duration_type_str == 'month':
+                    storage_duration_type = StorageDurationType.MONTH
+                elif storage_duration_type_str == 'year':
+                    storage_duration_type = StorageDurationType.YEAR
+                else:
+                    storage_duration_type = StorageDurationType.DAY
+
                 product = Product(
                     sid=Base.generate_sid(),
                     category_sid=category.sid,
@@ -77,7 +87,8 @@ async def upload_file(
                     default_unit=record.get('unit'),
                     default_price=float(record.get('price')) if record.get('price') is not None else None,
                     currency=Currency.KZT,
-                    storage_duration=int(record.get('storage_duration', 30)),
+                    storage_duration=storage_duration,
+                    storage_duration_type=storage_duration_type,
                 )
                 db.add(product)
                 await db.commit()
@@ -125,7 +136,7 @@ async def upload_file(
 async def get_warehouse_items(
         skip: int = 0,
         limit: int = 100,
-        upload_sid: str = None,
+        upload_sid: Optional[str] = None,
         expire_soon: bool = False,
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
@@ -313,11 +324,19 @@ async def move_to_store(
         response = {
             "message": "Item moved to store successfully",
             "store_item_sid": store_item.sid,
-            "price": final_price
+            "price": final_price,
+            "product_name": product.name,
+            "category": category.name,
+            "expire_date": warehouse_item.expire_date.isoformat() if warehouse_item.expire_date else None
         }
 
         if price is None:
             response["suggested_price"] = suggested_price
+            response["price_calculation"] = {
+                "base_price": base_price,
+                "final_price": final_price,
+                "markup_applied": round((final_price / base_price - 1) * 100, 2) if base_price > 0 else 0
+            }
 
         if discount_suggestion:
             response["discount_suggestion"] = discount_suggestion
@@ -329,6 +348,7 @@ async def move_to_store(
 
     finally:
         await redis.delete(lock_key)
+
 
 @router.post("/to-store-by-barcode", response_model=Dict[str, Any])
 async def move_to_store_by_barcode(
@@ -425,11 +445,19 @@ async def move_to_store_by_barcode(
         response = {
             "message": "Item moved to store successfully",
             "store_item_sid": store_item.sid,
-            "price": final_price
+            "price": final_price,
+            "product_name": product.name,
+            "category": category.name,
+            "expire_date": warehouse_item.expire_date.isoformat() if warehouse_item.expire_date else None
         }
 
         if price is None:
             response["suggested_price"] = suggested_price
+            response["price_calculation"] = {
+                "base_price": base_price,
+                "final_price": final_price,
+                "markup_applied": round((final_price / base_price - 1) * 100, 2) if base_price > 0 else 0
+            }
 
         if discount_suggestion:
             response["discount_suggestion"] = discount_suggestion
