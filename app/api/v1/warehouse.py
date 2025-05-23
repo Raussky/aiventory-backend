@@ -23,7 +23,7 @@ from app.services.pricing import calculate_store_price, suggest_discount, sugges
 router = APIRouter()
 
 
-@router.post("/upload", response_model=UploadResponse)
+@router.post("/upload", response_model=Dict[str, Any])
 async def upload_file(
         file: UploadFile = File(...),
         current_user: User = Depends(get_current_user),
@@ -42,6 +42,8 @@ async def upload_file(
         await db.refresh(upload)
 
         records = await detect_and_parse_file(file)
+        updated_items_info = []
+        new_items_with_existing_barcode = []
 
         for record in records:
             category_name = record.get('category', 'Default')
@@ -96,6 +98,10 @@ async def upload_file(
                 await db.commit()
                 await db.refresh(product)
 
+            existing_items_updated = False
+            total_existing_quantity = 0
+            oldest_expire_date = None
+
             if barcode and product.barcode:
                 existing_items_query = await db.execute(
                     select(WarehouseItem)
@@ -111,17 +117,34 @@ async def upload_file(
                 )
                 existing_items = existing_items_query.scalars().all()
 
-                for existing_item in existing_items:
-                    if existing_item.expire_date:
-                        days_until_expiry = (existing_item.expire_date - datetime.date.today()).days
-                        if days_until_expiry <= 7:
-                            existing_item.urgency_level = UrgencyLevel.CRITICAL
-                        elif days_until_expiry <= 14:
-                            existing_item.urgency_level = UrgencyLevel.URGENT
+                if existing_items:
+                    existing_items_updated = True
+
+                    for existing_item in existing_items:
+                        total_existing_quantity += existing_item.quantity
+
+                        if existing_item.expire_date and (
+                                not oldest_expire_date or existing_item.expire_date < oldest_expire_date):
+                            oldest_expire_date = existing_item.expire_date
+
+                        if existing_item.expire_date:
+                            days_until_expiry = (existing_item.expire_date - datetime.date.today()).days
+                            if days_until_expiry <= 7:
+                                existing_item.urgency_level = UrgencyLevel.CRITICAL
+                            elif days_until_expiry <= 14:
+                                existing_item.urgency_level = UrgencyLevel.URGENT
+                            else:
+                                existing_item.urgency_level = UrgencyLevel.URGENT
                         else:
                             existing_item.urgency_level = UrgencyLevel.URGENT
-                    else:
-                        existing_item.urgency_level = UrgencyLevel.URGENT
+
+                    new_items_with_existing_barcode.append({
+                        "product_name": product_name,
+                        "barcode": barcode,
+                        "existing_quantity": total_existing_quantity,
+                        "oldest_expire_date": oldest_expire_date.isoformat() if oldest_expire_date else None,
+                        "new_quantity": int(record.get('quantity', 0))
+                    })
 
             expire_date = None
             if record.get('expire_date'):
@@ -152,10 +175,38 @@ async def upload_file(
 
             upload.rows_imported += 1
 
+            if existing_items_updated:
+                updated_items_info.append({
+                    "product_name": product_name,
+                    "barcode": barcode,
+                    "existing_items_count": len(existing_items),
+                    "total_existing_quantity": total_existing_quantity,
+                    "message": f"Внимание! На складе уже есть {total_existing_quantity} единиц товара '{product_name}' с штрих-кодом {barcode}. Рекомендуется срочно реализовать старые партии перед размещением новой поставки."
+                })
+
         await db.commit()
         await db.refresh(upload)
 
-        return upload
+        response_data = {
+            "sid": upload.sid,
+            "file_name": upload.file_name,
+            "uploaded_at": upload.uploaded_at.isoformat(),
+            "rows_imported": upload.rows_imported,
+            "urgent_actions_required": len(updated_items_info) > 0,
+            "updated_items": updated_items_info,
+            "summary": {
+                "total_new_items": upload.rows_imported,
+                "items_with_existing_stock": len(new_items_with_existing_barcode),
+                "message": f"Загружено {upload.rows_imported} новых позиций. " +
+                           (
+                               f"Обнаружено {len(new_items_with_existing_barcode)} товаров с существующими остатками на складе. Необходимо срочно реализовать старые партии!" if new_items_with_existing_barcode else "")
+            }
+        }
+
+        if new_items_with_existing_barcode:
+            response_data["existing_stock_details"] = new_items_with_existing_barcode
+
+        return response_data
 
     except Exception as e:
         await db.rollback()
@@ -225,6 +276,32 @@ async def get_warehouse_items(
             warehouse_item=item,
             category=category
         )
+
+        if item.urgency_level in [UrgencyLevel.URGENT, UrgencyLevel.CRITICAL]:
+            duplicate_items_query = await db.execute(
+                select(WarehouseItem)
+                .join(Product)
+                .join(Upload)
+                .where(
+                    Product.barcode == product.barcode,
+                    WarehouseItem.sid != item.sid,
+                    WarehouseItem.status == WarehouseItemStatus.IN_STOCK,
+                    Upload.user_sid == current_user.sid,
+                    WarehouseItem.quantity > 0,
+                    WarehouseItem.received_at > item.received_at
+                )
+            )
+            newer_items = duplicate_items_query.scalars().all()
+
+            if newer_items:
+                if not warehouse_action or warehouse_action.get('urgency') != 'critical':
+                    warehouse_action = {
+                        "action": "move_to_store_urgent",
+                        "urgency": "critical",
+                        "reason": f"Поступила новая партия этого товара. Необходимо срочно реализовать текущую партию!",
+                        "newer_batches_count": len(newer_items),
+                        "newer_batches_quantity": sum(item.quantity for item in newer_items)
+                    }
 
         response_item = WarehouseItemResponse(
             sid=item.sid,
