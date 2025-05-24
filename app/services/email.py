@@ -1,4 +1,3 @@
-# app/services/email.py
 from fastapi_mail import FastMail, MessageSchema, ConnectionConfig
 from app.core.config import settings
 from typing import List, Dict, Any
@@ -6,11 +5,8 @@ from loguru import logger
 from celery import shared_task
 import os
 
-# Флаг для определения режима разработки/тестирования
-# Проверяем наличие переменной окружения, если её нет, проверяем домен SMTP-сервера
 DEV_MODE = os.getenv("DEV_MODE", "0") == "1" or settings.SMTP_HOST == "smtp.example.com"
 
-# Настройка соединения с SMTP
 conf = ConnectionConfig(
     MAIL_USERNAME=settings.SMTP_USER,
     MAIL_PASSWORD=settings.SMTP_PASSWORD,
@@ -32,17 +28,12 @@ async def send_email(
         template_name: str = None,
         template_body: Dict[str, Any] = None
 ):
-    """
-    Отправляет email с помощью FastMail или эмулирует отправку в режиме разработки
-    """
-    # В режиме разработки просто логируем письмо без реальной отправки
     if DEV_MODE:
         logger.info(f"DEV MODE: Email to {email_to}, subject: {subject}")
-        logger.info(f"DEV MODE: Email body: {body[:100]}...")  # Логируем начало тела письма
+        logger.info(f"DEV MODE: Email body: {body[:100]}...")
         return True
 
     try:
-        # Создаем объект сообщения
         message = MessageSchema(
             subject=subject,
             recipients=[email_to],
@@ -50,10 +41,8 @@ async def send_email(
             subtype="html"
         )
 
-        # Создаем FastMail-клиент
         fm = FastMail(conf)
 
-        # Отправляем сообщение
         await fm.send_message(message)
         logger.info(f"Email sent to {email_to}, subject: {subject}")
         return True
@@ -62,11 +51,7 @@ async def send_email(
         return False
 
 
-@shared_task
-def send_verification_email(email_to: str, verification_code: str):
-    """
-    Отправляет email с кодом верификации
-    """
+async def send_verification_email(email_to: str, verification_code: str):
     subject = "Подтверждение регистрации"
     body = f"""
     <html>
@@ -79,17 +64,13 @@ def send_verification_email(email_to: str, verification_code: str):
     </html>
     """
 
-    return send_email(email_to=email_to, subject=subject, body=body)
+    return await send_email(email_to=email_to, subject=subject, body=body)
 
 
 @shared_task
 def send_expiry_notification(user_email: str, warehouse_items: List[Dict], store_items: List[Dict]):
-    """
-    Отправляет уведомление о товарах с истекающим сроком годности
-    """
     subject = "Товары с истекающим сроком годности"
 
-    # Формируем HTML-таблицы для складских товаров и товаров в магазине
     warehouse_table = ""
     if warehouse_items:
         warehouse_table = """

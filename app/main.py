@@ -1,11 +1,10 @@
-# app/main.py
 from fastapi import FastAPI, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import time
 from loguru import logger
 import uuid
-import aioredis
+from redis.asyncio import Redis
 from prometheus_client import Counter, Histogram, generate_latest
 from prometheus_client.openmetrics.exposition import CONTENT_TYPE_LATEST
 from fastapi.responses import Response
@@ -14,7 +13,6 @@ from app.api.v1 import auth, warehouse, store, prediction
 from app.core.config import settings
 from app.db.redis import get_redis
 
-# Метрики Prometheus
 REQUEST_COUNT = Counter(
     "app_request_count",
     "Application Request Count",
@@ -26,7 +24,6 @@ REQUEST_LATENCY = Histogram(
     ["app_name", "method", "endpoint"]
 )
 
-# Инициализация FastAPI приложения
 app = FastAPI(
     title="Inventory Management System API",
     description="API для управления запасами малого бизнеса",
@@ -36,17 +33,15 @@ app = FastAPI(
     openapi_url="/api/openapi.json"
 )
 
-# Настройка CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # В production изменить на конкретные домены
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# Middleware для логирования запросов
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     request_id = str(uuid.uuid4())
@@ -58,7 +53,6 @@ async def log_requests(request: Request, call_next):
         response = await call_next(request)
         process_time = time.time() - start_time
 
-        # Обновляем метрики Prometheus
         REQUEST_LATENCY.labels(
             "inventory-system",
             request.method,
@@ -85,7 +79,6 @@ async def log_requests(request: Request, call_next):
         )
 
 
-# Подключение роутеров API
 app.include_router(
     auth.router,
     prefix=f"{settings.API_V1_STR}/auth",
@@ -111,13 +104,11 @@ app.include_router(
 )
 
 
-# Эндпоинт для проверки состояния приложения
 @app.get("/api/health")
 async def health_check():
     return {"status": "ok"}
 
 
-# Эндпоинт для метрик Prometheus
 @app.get("/metrics")
 async def metrics():
     return Response(
@@ -134,11 +125,10 @@ async def startup_db_client():
         redis_url = f"redis://:{settings.REDIS_PASSWORD}@{settings.REDIS_HOST}:{settings.REDIS_PORT}"
 
     try:
-        app.state.redis = await aioredis.from_url(
+        app.state.redis = Redis.from_url(
             redis_url,
             decode_responses=True
         )
-        # Проверяем соединение
         await app.state.redis.ping()
         logger.info("Connected to Redis")
     except Exception as e:
@@ -148,12 +138,10 @@ async def startup_db_client():
         logger.error(f"- Port: {settings.REDIS_PORT}")
         logger.error("If running locally (not in Docker), set REDIS_HOST=localhost in .env file")
 
-        # Продолжаем запуск без Redis в режиме разработки
         if app.debug:
             logger.warning("Continuing startup without Redis in development mode")
             app.state.redis = None
         else:
-            # В продакшене лучше завершить запуск с ошибкой
             raise e
 
 

@@ -18,8 +18,14 @@ class PredictionBase(BaseModel):
     forecast_qty: float = Field(..., ge=0)
     model_version: str
 
+    class Config:
+        protected_namespaces = ()
+
 class PredictionCreate(PredictionBase):
     generated_at: datetime = Field(default_factory=datetime.utcnow)
+
+    class Config:
+        protected_namespaces = ()
 
 class PredictionResponse(PredictionBase):
     sid: str
@@ -30,6 +36,7 @@ class PredictionResponse(PredictionBase):
 
     class Config:
         from_attributes = True
+        protected_namespaces = ()
 
 class PredictionRequest(BaseModel):
     product_sid: str

@@ -69,16 +69,14 @@ async def get_store_items(
         current_discounts = []
         for d in item.discounts:
             if d.starts_at <= datetime.now(timezone.utc) <= d.ends_at:
-                current_discounts.append(
-                    DiscountResponse(
-                        sid=d.sid,
-                        store_item_sid=d.store_item_sid,
-                        percentage=d.percentage,
-                        starts_at=d.starts_at,
-                        ends_at=d.ends_at,
-                        created_by_sid=d.created_by_sid,
-                    )
-                )
+                current_discounts.append({
+                    "sid": d.sid,
+                    "store_item_sid": d.store_item_sid,
+                    "percentage": d.percentage,
+                    "starts_at": d.starts_at,
+                    "ends_at": d.ends_at,
+                    "created_by_sid": d.created_by_sid,
+                })
 
         response_item = StoreItemResponse(
             sid=item.sid,
