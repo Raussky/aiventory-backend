@@ -1,9 +1,10 @@
-from sqlalchemy import Column, String, Integer, Float, DateTime, Date, ForeignKey, Enum, Text
+from sqlalchemy import Column, String, Integer, Float, DateTime, Date, ForeignKey, Enum, Text, Boolean
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from datetime import datetime
 import enum
 from app.models.base import Base
+from datetime import datetime, timedelta, timezone
 
 
 class Currency(str, enum.Enum):
@@ -92,6 +93,7 @@ class StoreItem(Base):
 
     sales = relationship("Sale", back_populates="store_item")
     discounts = relationship("Discount", back_populates="store_item")
+    cart_items = relationship("CartItem", back_populates="store_item")
 
 
 class Discount(Base):
@@ -102,6 +104,16 @@ class Discount(Base):
     ends_at = Column(DateTime(timezone=True), nullable=False)
     created_by_sid = Column(String(22), ForeignKey("user.sid"), nullable=False)
     created_by = relationship("User")
+
+
+class CartItem(Base):
+    store_item_sid = Column(String(22), ForeignKey("storeitem.sid"), nullable=False)
+    store_item = relationship("StoreItem", back_populates="cart_items")
+    user_sid = Column(String(22), ForeignKey("user.sid"), nullable=False)
+    user = relationship("User")
+    quantity = Column(Integer, nullable=False)
+    price_per_unit = Column(Float, nullable=False)
+    added_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
 class Sale(Base):

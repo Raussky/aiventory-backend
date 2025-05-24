@@ -1,19 +1,20 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import selectinload
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 from redis.asyncio import Redis
 
 from app.db.session import get_db
 from app.db.redis import get_redis
 from app.models.users import User
-from app.models.inventory import StoreItem, StoreItemStatus, Discount, Sale, WarehouseItem, Product, Upload
+from app.models.inventory import StoreItem, StoreItemStatus, Discount, Sale, WarehouseItem, Product, Upload, CartItem
 from app.schemas.store import (
     StoreItemResponse, StoreItemCreate, DiscountCreate,
-    DiscountResponse, SaleCreate, SaleResponse
+    DiscountResponse, SaleCreate, SaleResponse, CartItemCreate,
+    CartItemResponse, CheckoutRequest, CheckoutResponse
 )
 from app.schemas.inventory import ProductResponse
 from app.models.base import Base
@@ -67,7 +68,7 @@ async def get_store_items(
     for item in items:
         current_discounts = []
         for d in item.discounts:
-            if d.starts_at <= datetime.utcnow() <= d.ends_at:
+            if d.starts_at <= datetime.now(timezone.utc) <= d.ends_at:
                 current_discounts.append(
                     DiscountResponse(
                         sid=d.sid,
@@ -96,6 +97,324 @@ async def get_store_items(
             ),
             expire_date=item.warehouse_item.expire_date,
             current_discounts=current_discounts
+        )
+        response.append(response_item)
+
+    return response
+
+@router.get("/cart/items", response_model=List[CartItemResponse])
+async def get_cart_items(
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+):
+    query = (
+        select(CartItem)
+        .options(
+            selectinload(CartItem.store_item)
+            .selectinload(StoreItem.warehouse_item)
+            .selectinload(WarehouseItem.product)
+            .selectinload(Product.category),
+            selectinload(CartItem.store_item)
+            .selectinload(StoreItem.discounts)
+        )
+        .where(CartItem.user_sid == current_user.sid)
+        .order_by(CartItem.added_at.desc())
+    )
+
+    result = await db.execute(query)
+    cart_items = result.scalars().all()
+
+    response = []
+    for cart_item in cart_items:
+        response_item = CartItemResponse(
+            sid=cart_item.sid,
+            store_item_sid=cart_item.store_item_sid,
+            quantity=cart_item.quantity,
+            price_per_unit=cart_item.price_per_unit,
+            added_at=cart_item.added_at,
+            user_sid=cart_item.user_sid,
+            product=ProductResponse(
+                sid=cart_item.store_item.warehouse_item.product.sid,
+                name=cart_item.store_item.warehouse_item.product.name,
+                category_sid=cart_item.store_item.warehouse_item.product.category_sid,
+                barcode=cart_item.store_item.warehouse_item.product.barcode,
+                default_unit=cart_item.store_item.warehouse_item.product.default_unit,
+                default_price=cart_item.store_item.warehouse_item.product.default_price,
+            ),
+            expire_date=cart_item.store_item.warehouse_item.expire_date,
+            total_price=cart_item.quantity * cart_item.price_per_unit
+        )
+        response.append(response_item)
+
+    return response
+
+@router.post("/cart/add", response_model=CartItemResponse)
+async def add_to_cart(
+        cart_item: CartItemCreate,
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+):
+    store_item_query = await db.execute(
+        select(StoreItem)
+        .options(
+            selectinload(StoreItem.warehouse_item)
+            .selectinload(WarehouseItem.product),
+            selectinload(StoreItem.discounts)
+        )
+        .join(WarehouseItem)
+        .join(Upload)
+        .where(
+            StoreItem.sid == cart_item.store_item_sid,
+            StoreItem.status == StoreItemStatus.ACTIVE,
+            Upload.user_sid == current_user.sid
+        )
+    )
+    store_item = store_item_query.scalar_one_or_none()
+
+    if not store_item:
+        raise HTTPException(
+            status_code=404,
+            detail="Active store item not found"
+        )
+
+    if store_item.quantity < cart_item.quantity:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Not enough quantity available (requested: {cart_item.quantity}, available: {store_item.quantity})"
+        )
+
+    existing_cart_item_query = await db.execute(
+        select(CartItem).where(
+            CartItem.store_item_sid == cart_item.store_item_sid,
+            CartItem.user_sid == current_user.sid
+        )
+    )
+    existing_cart_item = existing_cart_item_query.scalar_one_or_none()
+
+    current_discounts = []
+    for d in store_item.discounts:
+        if d.starts_at <= datetime.now(timezone.utc) <= d.ends_at:
+            current_discounts.append(d)
+
+    price_per_unit = store_item.price
+    if current_discounts:
+        max_discount = max(d.percentage for d in current_discounts)
+        price_per_unit = store_item.price * (1 - max_discount / 100)
+
+    if existing_cart_item:
+        if existing_cart_item.quantity + cart_item.quantity > store_item.quantity:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Total quantity exceeds available stock"
+            )
+        existing_cart_item.quantity += cart_item.quantity
+        existing_cart_item.price_per_unit = price_per_unit
+        await db.commit()
+        await db.refresh(existing_cart_item)
+        new_cart_item = existing_cart_item
+    else:
+        new_cart_item = CartItem(
+            sid=Base.generate_sid(),
+            store_item_sid=cart_item.store_item_sid,
+            user_sid=current_user.sid,
+            quantity=cart_item.quantity,
+            price_per_unit=price_per_unit,
+        )
+        db.add(new_cart_item)
+        await db.commit()
+        await db.refresh(new_cart_item)
+
+    return CartItemResponse(
+        sid=new_cart_item.sid,
+        store_item_sid=new_cart_item.store_item_sid,
+        quantity=new_cart_item.quantity,
+        price_per_unit=new_cart_item.price_per_unit,
+        added_at=new_cart_item.added_at,
+        user_sid=new_cart_item.user_sid,
+        product=ProductResponse(
+            sid=store_item.warehouse_item.product.sid,
+            name=store_item.warehouse_item.product.name,
+            category_sid=store_item.warehouse_item.product.category_sid,
+            barcode=store_item.warehouse_item.product.barcode,
+            default_unit=store_item.warehouse_item.product.default_unit,
+            default_price=store_item.warehouse_item.product.default_price,
+        ),
+        expire_date=store_item.warehouse_item.expire_date,
+        total_price=new_cart_item.quantity * new_cart_item.price_per_unit
+    )
+
+@router.delete("/cart/remove/{cart_item_sid}")
+async def remove_from_cart(
+        cart_item_sid: str,
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+):
+    cart_item_query = await db.execute(
+        select(CartItem).where(
+            CartItem.sid == cart_item_sid,
+            CartItem.user_sid == current_user.sid
+        )
+    )
+    cart_item = cart_item_query.scalar_one_or_none()
+
+    if not cart_item:
+        raise HTTPException(status_code=404, detail="Cart item not found")
+
+    await db.delete(cart_item)
+    await db.commit()
+
+    return {"message": "Item removed from cart"}
+
+@router.post("/cart/checkout", response_model=CheckoutResponse)
+async def checkout_cart(
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+        redis: Redis = Depends(get_redis),
+):
+    cart_items_query = await db.execute(
+        select(CartItem)
+        .options(
+            selectinload(CartItem.store_item)
+            .selectinload(StoreItem.warehouse_item)
+            .selectinload(WarehouseItem.product)
+        )
+        .where(CartItem.user_sid == current_user.sid)
+    )
+    cart_items = cart_items_query.scalars().all()
+
+    if not cart_items:
+        raise HTTPException(status_code=400, detail="Cart is empty")
+
+    sales = []
+    total_amount = 0
+    items_count = 0
+
+    for cart_item in cart_items:
+        store_item = cart_item.store_item
+
+        if store_item.status != StoreItemStatus.ACTIVE:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Item {store_item.warehouse_item.product.name} is no longer active"
+            )
+
+        if store_item.quantity < cart_item.quantity:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Not enough quantity for {store_item.warehouse_item.product.name}"
+            )
+
+        sale = Sale(
+            sid=Base.generate_sid(),
+            store_item_sid=cart_item.store_item_sid,
+            sold_qty=cart_item.quantity,
+            sold_price=cart_item.price_per_unit,
+            sold_at=datetime.now(timezone.utc),
+            cashier_sid=current_user.sid,
+        )
+
+        store_item.quantity -= cart_item.quantity
+        if store_item.quantity == 0:
+            store_item.status = StoreItemStatus.REMOVED
+
+        db.add(sale)
+        sales.append(SaleResponse(
+            sid=sale.sid,
+            store_item_sid=sale.store_item_sid,
+            sold_qty=sale.sold_qty,
+            sold_price=sale.sold_price,
+            sold_at=sale.sold_at,
+            cashier_sid=sale.cashier_sid,
+            product=ProductResponse(
+                sid=store_item.warehouse_item.product.sid,
+                name=store_item.warehouse_item.product.name,
+                category_sid=store_item.warehouse_item.product.category_sid,
+                barcode=store_item.warehouse_item.product.barcode,
+                default_unit=store_item.warehouse_item.product.default_unit,
+                default_price=store_item.warehouse_item.product.default_price,
+            ),
+            total_amount=sale.sold_qty * sale.sold_price
+        ))
+
+        total_amount += cart_item.quantity * cart_item.price_per_unit
+        items_count += cart_item.quantity
+
+        await db.delete(cart_item)
+
+    await db.commit()
+
+    await redis.publish(
+        f"sales:{current_user.sid}",
+        json.dumps({
+            "type": "checkout_complete",
+            "total_amount": total_amount,
+            "items_count": items_count,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+    )
+
+    return CheckoutResponse(
+        sales=sales,
+        total_amount=total_amount,
+        items_count=items_count
+    )
+
+@router.get("/sales", response_model=List[SaleResponse])
+async def get_sales(
+        skip: int = 0,
+        limit: int = 100,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+):
+    query = (
+        select(Sale)
+        .options(
+            selectinload(Sale.store_item)
+            .selectinload(StoreItem.warehouse_item)
+            .selectinload(WarehouseItem.product)
+            .selectinload(Product.category),
+            selectinload(Sale.store_item)
+            .selectinload(StoreItem.warehouse_item)
+            .selectinload(WarehouseItem.upload)
+        )
+        .join(StoreItem)
+        .join(WarehouseItem)
+        .join(Upload)
+        .where(Upload.user_sid == current_user.sid)
+    )
+
+    if start_date:
+        query = query.where(Sale.sold_at >= start_date)
+    if end_date:
+        query = query.where(Sale.sold_at <= end_date)
+
+    result = await db.execute(
+        query.order_by(Sale.sold_at.desc())
+        .offset(skip)
+        .limit(limit)
+    )
+    sales = result.scalars().all()
+
+    response = []
+    for sale in sales:
+        response_item = SaleResponse(
+            sid=sale.sid,
+            store_item_sid=sale.store_item_sid,
+            sold_qty=sale.sold_qty,
+            sold_price=sale.sold_price,
+            sold_at=sale.sold_at,
+            cashier_sid=sale.cashier_sid,
+            product=ProductResponse(
+                sid=sale.store_item.warehouse_item.product.sid,
+                name=sale.store_item.warehouse_item.product.name,
+                category_sid=sale.store_item.warehouse_item.product.category_sid,
+                barcode=sale.store_item.warehouse_item.product.barcode,
+                default_unit=sale.store_item.warehouse_item.product.default_unit,
+                default_price=sale.store_item.warehouse_item.product.default_price,
+            ),
+            total_amount=sale.sold_qty * sale.sold_price
         )
         response.append(response_item)
 
@@ -266,7 +585,7 @@ async def record_sale(
         store_item_sid=sale.store_item_sid,
         sold_qty=sale.sold_qty,
         sold_price=sale.sold_price,
-        sold_at=datetime.utcnow(),
+        sold_at=datetime.now(timezone.utc),
         cashier_sid=current_user.sid,
     )
 
@@ -289,7 +608,7 @@ async def record_sale(
             "quantity": sale.sold_qty,
             "price": sale.sold_price,
             "total": sale.sold_qty * sale.sold_price,
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         })
     )
 
@@ -304,10 +623,10 @@ async def get_store_reports(
         redis: Redis = Depends(get_redis),
 ):
     if not start_date:
-        start_date = datetime.utcnow() - timedelta(days=30)
+        start_date = datetime.now(timezone.utc) - timedelta(days=30)
 
     if not end_date:
-        end_date = datetime.utcnow()
+        end_date = datetime.now(timezone.utc)
 
     cache_key = f"store:reports:{current_user.sid}:{start_date.date()}:{end_date.date()}"
 
@@ -341,7 +660,7 @@ async def get_store_reports(
     """
 
     sales_result = await db.execute(
-        sales_query,
+        text(sales_query),
         {"start_date": start_date, "end_date": end_date, "user_sid": current_user.sid}
     )
     sales_data = sales_result.fetchall()
@@ -378,7 +697,7 @@ async def get_store_reports(
     """
 
     discounts_result = await db.execute(
-        discounts_query,
+        text(discounts_query),
         {"start_date": start_date, "end_date": end_date, "user_sid": current_user.sid}
     )
     discounts_data = discounts_result.fetchall()
@@ -411,7 +730,7 @@ async def get_store_reports(
     """
 
     expired_result = await db.execute(
-        expired_query,
+        text(expired_query),
         {"start_date": start_date, "end_date": end_date, "user_sid": current_user.sid}
     )
     expired_data = expired_result.fetchall()
