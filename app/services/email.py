@@ -5,8 +5,6 @@ from loguru import logger
 from celery import shared_task
 import os
 
-DEV_MODE = os.getenv("DEV_MODE", "0") == "1" or settings.SMTP_HOST == "smtp.example.com"
-
 conf = ConnectionConfig(
     MAIL_USERNAME=settings.SMTP_USER,
     MAIL_PASSWORD=settings.SMTP_PASSWORD,
@@ -28,11 +26,6 @@ async def send_email(
         template_name: str = None,
         template_body: Dict[str, Any] = None
 ):
-    if DEV_MODE:
-        logger.info(f"DEV MODE: Email to {email_to}, subject: {subject}")
-        logger.info(f"DEV MODE: Email body: {body[:100]}...")
-        return True
-
     try:
         message = MessageSchema(
             subject=subject,
@@ -55,11 +48,17 @@ async def send_verification_email(email_to: str, verification_code: str):
     subject = "Подтверждение регистрации"
     body = f"""
     <html>
-    <body>
-        <h2>Подтверждение регистрации</h2>
-        <p>Спасибо за регистрацию в системе управления запасами!</p>
-        <p>Ваш код подтверждения: <strong>{verification_code}</strong></p>
-        <p>Введите его на странице верификации для активации аккаунта.</p>
+    <body style="font-family: Arial, sans-serif; background-color: #f4f4f4; padding: 20px;">
+        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 30px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+            <h1 style="color: #6322FE; text-align: center; margin-bottom: 30px;">Подтверждение регистрации</h1>
+            <p style="color: #333; font-size: 16px; line-height: 1.5;">Спасибо за регистрацию в системе управления запасами!</p>
+            <p style="color: #333; font-size: 16px; line-height: 1.5;">Ваш код подтверждения:</p>
+            <div style="background-color: #f8f9fa; padding: 20px; border-radius: 5px; text-align: center; margin: 20px 0;">
+                <h2 style="color: #6322FE; font-size: 32px; letter-spacing: 5px; margin: 0;">{verification_code}</h2>
+            </div>
+            <p style="color: #666; font-size: 14px; line-height: 1.5;">Этот код действителен в течение 24 часов.</p>
+            <p style="color: #666; font-size: 14px; line-height: 1.5;">Если вы не регистрировались в нашей системе, просто проигнорируйте это письмо.</p>
+        </div>
     </body>
     </html>
     """

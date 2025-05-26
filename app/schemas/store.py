@@ -14,14 +14,8 @@ class StoreItemStatus(str, Enum):
 
 class StoreItemBase(BaseModel):
     warehouse_item_sid: str
-    quantity: int = Field(..., gt=0)
+    quantity: int = Field(..., ge=0)
     price: float = Field(..., gt=0)
-
-    @validator('quantity')
-    def quantity_must_be_positive(cls, v):
-        if v <= 0:
-            raise ValueError('Quantity must be positive')
-        return v
 
     @validator('price')
     def price_must_be_positive(cls, v):

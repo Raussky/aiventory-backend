@@ -57,6 +57,8 @@ async def get_store_items(
 
     if status:
         query = query.where(StoreItem.status == status)
+    else:
+        query = query.where(StoreItem.quantity > 0)
 
     result = await db.execute(
         query.order_by(StoreItem.moved_at.desc())
@@ -67,6 +69,9 @@ async def get_store_items(
 
     response = []
     for item in items:
+        if item.quantity <= 0 and status != StoreItemStatus.REMOVED:
+            continue
+
         current_discounts = []
         for d in item.discounts:
             if d.starts_at <= datetime.now(timezone.utc) <= d.ends_at:
@@ -89,7 +94,7 @@ async def get_store_items(
         response_item = StoreItemResponse(
             sid=item.sid,
             warehouse_item_sid=item.warehouse_item_sid,
-            quantity=item.quantity,
+            quantity=max(0, item.quantity),
             price=item.price,
             moved_at=item.moved_at,
             status=item.status,
@@ -109,7 +114,7 @@ async def get_store_items(
             current_discounts=current_discounts,
             batch_code=item.warehouse_item.batch_code,
             days_until_expiry=(
-                        item.warehouse_item.expire_date - datetime.now().date()).days if item.warehouse_item.expire_date else None
+                    item.warehouse_item.expire_date - datetime.now().date()).days if item.warehouse_item.expire_date else None
         )
         response.append(response_item)
 
@@ -155,7 +160,7 @@ async def get_removed_items(
 
     response = []
     for item in items:
-        lost_value = item.price * item.quantity
+        lost_value = item.price * max(0, item.quantity)
 
         if item.status == StoreItemStatus.EXPIRED:
             removal_reason = "Истек срок годности"
@@ -172,7 +177,7 @@ async def get_removed_items(
         response_item = RemovedItemsResponse(
             sid=item.sid,
             warehouse_item_sid=item.warehouse_item_sid,
-            quantity=item.quantity,
+            quantity=max(0, item.quantity),
             price=item.price,
             moved_at=item.moved_at,
             removed_at=item.moved_at,
@@ -265,6 +270,8 @@ async def record_sale(
     await db.refresh(new_sale)
 
     await redis.delete(f"store:items:{current_user.sid}:*")
+    await redis.delete(f"dashboard:stats:{current_user.sid}")
+    await redis.delete(f"store:reports:{current_user.sid}:*")
 
     await redis.publish(
         f"sales:{current_user.sid}",
@@ -377,6 +384,8 @@ async def record_sale_by_barcode(
     await db.refresh(new_sale)
 
     await redis.delete(f"store:items:{current_user.sid}:*")
+    await redis.delete(f"dashboard:stats:{current_user.sid}")
+    await redis.delete(f"store:reports:{current_user.sid}:*")
 
     await redis.publish(
         f"sales:{current_user.sid}",
@@ -604,7 +613,7 @@ async def mark_as_expired(
     return StoreItemResponse(
         sid=store_item.sid,
         warehouse_item_sid=store_item.warehouse_item_sid,
-        quantity=store_item.quantity,
+        quantity=max(0, store_item.quantity),
         price=store_item.price,
         moved_at=store_item.moved_at,
         status=store_item.status,
@@ -624,7 +633,7 @@ async def mark_as_expired(
         current_discounts=current_discounts,
         batch_code=store_item.warehouse_item.batch_code,
         days_until_expiry=(
-                    store_item.warehouse_item.expire_date - datetime.now().date()).days if store_item.warehouse_item.expire_date else None
+                store_item.warehouse_item.expire_date - datetime.now().date()).days if store_item.warehouse_item.expire_date else None
     )
 
 
@@ -685,7 +694,7 @@ async def remove_from_store(
     return StoreItemResponse(
         sid=store_item.sid,
         warehouse_item_sid=store_item.warehouse_item_sid,
-        quantity=store_item.quantity,
+        quantity=max(0, store_item.quantity),
         price=store_item.price,
         moved_at=store_item.moved_at,
         status=store_item.status,
@@ -705,7 +714,7 @@ async def remove_from_store(
         current_discounts=current_discounts,
         batch_code=store_item.warehouse_item.batch_code,
         days_until_expiry=(
-                    store_item.warehouse_item.expire_date - datetime.now().date()).days if store_item.warehouse_item.expire_date else None
+                store_item.warehouse_item.expire_date - datetime.now().date()).days if store_item.warehouse_item.expire_date else None
     )
 
 
@@ -863,7 +872,8 @@ async def get_store_reports(
                 "sold_quantity": float(row.sold_quantity) if row.sold_quantity else 0,
                 "discounted_revenue": float(row.discounted_revenue) if row.discounted_revenue else 0,
                 "regular_revenue": float(row.regular_revenue) if row.regular_revenue else 0,
-                "savings": float(row.regular_revenue - row.discounted_revenue) if row.regular_revenue and row.discounted_revenue else 0
+                "savings": float(
+                    row.regular_revenue - row.discounted_revenue) if row.regular_revenue and row.discounted_revenue else 0
             }
             for row in discounts_data
         ],
