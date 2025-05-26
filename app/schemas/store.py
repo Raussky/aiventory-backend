@@ -37,6 +37,16 @@ class StoreItemResponse(StoreItemBase):
     product: Optional[ProductResponse] = None
     expire_date: Optional[datetime] = None
     current_discounts: Optional[List[Dict[str, Any]]] = []
+    batch_code: Optional[str] = None
+    days_until_expiry: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+
+class RemovedItemsResponse(StoreItemResponse):
+    removed_at: datetime
+    lost_value: float
+    removal_reason: str
 
     class Config:
         from_attributes = True
@@ -63,30 +73,11 @@ class DiscountResponse(DiscountBase):
     class Config:
         from_attributes = True
 
-class CartItemBase(BaseModel):
-    store_item_sid: str
-    quantity: int = Field(..., gt=0)
-    price_per_unit: float = Field(..., ge=0)
-
-class CartItemCreate(BaseModel):
-    store_item_sid: str
-    quantity: int = Field(..., gt=0)
-
-class CartItemResponse(CartItemBase):
-    sid: str
-    added_at: datetime
-    user_sid: str
-    product: Optional[ProductResponse] = None
-    expire_date: Optional[datetime] = None
-    total_price: Optional[float] = None
-
-    class Config:
-        from_attributes = True
-
 class SaleBase(BaseModel):
     store_item_sid: str
     sold_qty: int = Field(..., gt=0)
     sold_price: float = Field(..., ge=0)
+    ignore_discount: Optional[bool] = False
 
 class SaleCreate(SaleBase):
     pass
@@ -100,14 +91,6 @@ class SaleResponse(SaleBase):
 
     class Config:
         from_attributes = True
-
-class CheckoutRequest(BaseModel):
-    cart_item_sids: List[str] = Field(..., min_items=1)
-
-class CheckoutResponse(BaseModel):
-    sales: List[SaleResponse]
-    total_amount: float
-    items_count: int
 
 class StoreItemFilter(BaseModel):
     status: Optional[StoreItemStatus] = None
