@@ -1,4 +1,3 @@
-# app/api/v1/prediction.py
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -31,7 +30,6 @@ async def get_products(
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
 ):
-    """Get all products with optional filtering"""
     query = select(Product).options(selectinload(Product.category))
 
     if category_sid:
@@ -58,7 +56,6 @@ async def get_categories(
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
 ):
-    """Get all categories with optional filtering"""
     query = select(Category)
 
     if search:
@@ -83,8 +80,6 @@ async def get_forecast(
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
 ):
-    """Get demand forecast for a product"""
-    # Check product exists
     product_query = await db.execute(
         select(Product).where(Product.sid == product_sid)
     )
@@ -93,9 +88,7 @@ async def get_forecast(
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    # If no refresh requested, try to find existing forecasts
     if not refresh:
-        # Find latest forecasts with this time frame
         predictions_query = await db.execute(
             select(Prediction)
             .where(
@@ -108,11 +101,9 @@ async def get_forecast(
         )
         predictions = predictions_query.scalars().all()
 
-        # If we have recent predictions, return them
         if predictions and len(predictions) == periods:
             return predictions
 
-    # Generate new forecast
     prediction_service = PredictionService(db)
     forecasts = await prediction_service.generate_forecast(
         product_sid=product_sid,
@@ -126,7 +117,6 @@ async def get_forecast(
             detail="Could not generate forecast. Not enough sales data."
         )
 
-    # Save forecasts
     predictions = await prediction_service.save_forecast(forecasts)
 
     return predictions
@@ -142,23 +132,19 @@ async def get_prediction_stats(
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
 ):
-    """Get sales statistics for visualization"""
-    # Set default date range if not provided
     if not start_date:
         start_date = datetime.now() - timedelta(days=90)
 
     if not end_date:
         end_date = datetime.now()
 
-    # Build query based on grouping option
     if group_by == "day":
         date_format = "DATE(s.sold_at)"
     elif group_by == "week":
         date_format = "DATE_TRUNC('week', s.sold_at)"
-    else:  # month
+    else:
         date_format = "DATE_TRUNC('month', s.sold_at)"
 
-    # Start building the query
     query_text = f"""
         SELECT 
             {date_format} as date,
@@ -166,7 +152,7 @@ async def get_prediction_stats(
             p.sid as product_sid,
             c.name as category_name,
             c.sid as category_sid,
-            SUM(s.sold_qty) as quantity,
+            SUM(s.sold_qtySUM(s.sold_qty) as quantity,
             SUM(s.sold_qty * s.sold_price) as revenue
         FROM 
             sale s
@@ -203,7 +189,6 @@ async def get_prediction_stats(
         result = await db.execute(text(query_text), params)
         rows = result.fetchall()
 
-        # Convert to dataframe for easier manipulation
         df = pd.DataFrame(rows, columns=["date", "product_name", "product_sid",
                                          "category_name", "category_sid",
                                          "quantity", "revenue"])
@@ -217,17 +202,14 @@ async def get_prediction_stats(
                 "revenue_data": []
             }
 
-        # Format date properly
         df["date_str"] = df["date"].apply(
             lambda x: x.strftime("%Y-%m-%d") if hasattr(x, "strftime") else str(x)
         )
 
-        # Get unique dates, products and categories
         dates = df["date_str"].unique().tolist()
         products = df[["product_sid", "product_name"]].drop_duplicates().to_dict("records")
         categories = df[["category_sid", "category_name"]].drop_duplicates().to_dict("records")
 
-        # Create pivot tables
         quantity_pivot = df.pivot_table(
             index="date_str",
             columns="product_sid",
@@ -242,7 +224,6 @@ async def get_prediction_stats(
             fill_value=0
         ).reset_index().to_dict("records")
 
-        # Add category totals if not filtering by product
         if not product_sid:
             category_quantity = df.groupby(["date_str", "category_sid"])["quantity"].sum().reset_index()
             category_revenue = df.groupby(["date_str", "category_sid"])["revenue"].sum().reset_index()
@@ -283,88 +264,12 @@ async def get_prediction_stats(
         raise HTTPException(status_code=500, detail=f"Error processing sales data: {str(e)}")
 
 
-@router.get("/trends/{product_sid}", response_model=Dict[str, Any])
-async def get_product_trends(
-        product_sid: str,
-        days_back: int = Query(90, ge=7, le=365),
-        current_user: User = Depends(get_current_user),
-        db: AsyncSession = Depends(get_db),
-):
-    """Get sales trends for a specific product"""
-    product_query = await db.execute(
-        select(Product).where(Product.sid == product_sid)
-    )
-    product = product_query.scalar_one_or_none()
-
-    if not product:
-        raise HTTPException(status_code=404, detail="Product not found")
-
-    prediction_service = PredictionService(db)
-    trends = await prediction_service.get_sales_trends(
-        product_sid=product_sid,
-        days_back=days_back
-    )
-
-    return trends
-
-
-@router.get("/category-trends/{category_sid}", response_model=Dict[str, Any])
-async def get_category_trends(
-        category_sid: str,
-        days_back: int = Query(90, ge=7, le=365),
-        current_user: User = Depends(get_current_user),
-        db: AsyncSession = Depends(get_db),
-):
-    """Get sales trends for a product category"""
-    from app.models.inventory import Category
-
-    category_query = await db.execute(
-        select(Category).where(Category.sid == category_sid)
-    )
-    category = category_query.scalar_one_or_none()
-
-    if not category:
-        raise HTTPException(status_code=404, detail="Category not found")
-
-    prediction_service = PredictionService(db)
-    trends = await prediction_service.get_sales_trends(
-        category_sid=category_sid,
-        days_back=days_back
-    )
-
-    return trends
-
-
-@router.get("/seasonality/{category_sid}", response_model=Dict[str, Any])
-async def get_category_seasonality(
-        category_sid: str,
-        current_user: User = Depends(get_current_user),
-        db: AsyncSession = Depends(get_db),
-):
-    """Get seasonality patterns for a product category"""
-    from app.models.inventory import Category
-
-    category_query = await db.execute(
-        select(Category).where(Category.sid == category_sid)
-    )
-    category = category_query.scalar_one_or_none()
-
-    if not category:
-        raise HTTPException(status_code=404, detail="Category not found")
-
-    prediction_service = PredictionService(db)
-    seasonality = await prediction_service.get_category_seasonality(category_sid)
-
-    return seasonality
-
-
 @router.get("/analytics/{product_sid}", response_model=Dict[str, Any])
 async def get_product_analytics(
         product_sid: str,
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
 ):
-    """Get comprehensive analytics for a specific product"""
     product_query = await db.execute(
         select(Product).where(Product.sid == product_sid)
     )
@@ -382,119 +287,45 @@ async def get_product_analytics(
     return analytics
 
 
-@router.get("/top-products", response_model=List[Dict[str, Any]])
-async def get_top_products(
-        limit: int = Query(10, ge=1, le=50),
-        days_back: int = Query(30, ge=1, le=365),
-        metric: str = Query("quantity", regex="^(quantity|revenue)$"),
+@router.get("/trends/{product_sid}", response_model=Dict[str, Any])
+async def get_product_trends(
+        product_sid: str,
+        days_back: int = Query(90, ge=7, le=365),
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
 ):
-    """Get top-selling products by quantity or revenue"""
-    query = text("""
-        SELECT 
-            p.sid as product_sid,
-            p.name as product_name,
-            c.name as category_name,
-            SUM(s.sold_qty) as quantity,
-            SUM(s.sold_qty * s.sold_price) as revenue
-        FROM 
-            sale s
-        JOIN 
-            storeitem si ON s.store_item_sid = si.sid
-        JOIN 
-            warehouseitem wi ON si.warehouse_item_sid = wi.sid
-        JOIN 
-            product p ON wi.product_sid = p.sid
-        JOIN
-            category c ON p.category_sid = c.sid
-        WHERE 
-            s.sold_at >= :min_date
-        GROUP BY 
-            p.sid, p.name, c.name
-        ORDER BY 
-            :order_field DESC
-        LIMIT :limit
-    """)
+    product_query = await db.execute(
+        select(Product).where(Product.sid == product_sid)
+    )
+    product = product_query.scalar_one_or_none()
 
-    min_date = datetime.now() - timedelta(days=days_back)
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
 
-    # Use a literal to make the SQL order by work
-    order_field = "revenue" if metric == "revenue" else "quantity"
+    prediction_service = PredictionService(db)
+    trends = await prediction_service.get_sales_trends(
+        product_sid=product_sid,
+        days_back=days_back
+    )
 
-    try:
-        params = {"min_date": min_date, "limit": limit, "order_field": order_field}
-        result = await db.execute(query, params)
-        rows = result.fetchall()
-
-        return [
-            {
-                "product_sid": row.product_sid,
-                "product_name": row.product_name,
-                "category_name": row.category_name,
-                "quantity": float(row.quantity),
-                "revenue": float(row.revenue)
-            }
-            for row in rows
-        ]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching top products: {str(e)}")
+    return trends
 
 
-@router.get("/dashboard-metrics", response_model=Dict[str, Any])
-async def get_dashboard_metrics(
-        days_back: int = Query(30, ge=1, le=365),
+@router.get("/insights", response_model=Dict[str, Any])
+async def get_insights(
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
 ):
-    """Get summary metrics for dashboard"""
     query = text("""
-        SELECT 
-            COUNT(DISTINCT p.sid) as product_count,
-            COUNT(DISTINCT c.sid) as category_count,
-            SUM(s.sold_qty) as total_quantity,
-            SUM(s.sold_qty * s.sold_price) as total_revenue,
-            COUNT(DISTINCT DATE(s.sold_at)) as sales_days,
-            COUNT(DISTINCT wi.sid) as warehouse_items_count,
-            SUM(wi.quantity) as warehouse_total_quantity
-        FROM 
-            product p
-        LEFT JOIN
-            category c ON p.category_sid = c.sid
-        LEFT JOIN
-            warehouseitem wi ON wi.product_sid = p.sid AND wi.status = 'IN_STOCK'
-        LEFT JOIN
-            storeitem si ON si.warehouse_item_sid = wi.sid AND si.status = 'ACTIVE'
-        LEFT JOIN
-            sale s ON s.store_item_sid = si.sid AND s.sold_at >= :min_date
-    """)
-
-    min_date = datetime.now() - timedelta(days=days_back)
-
-    try:
-        result = await db.execute(query, {"min_date": min_date})
-        row = result.fetchone()
-
-        if not row:
-            return {
-                "product_count": 0,
-                "category_count": 0,
-                "total_quantity": 0,
-                "total_revenue": 0,
-                "avg_daily_sales": 0,
-                "warehouse_items_count": 0,
-                "warehouse_total_quantity": 0
-            }
-
-        # Calculate average daily sales
-        avg_daily_sales = row.total_quantity / max(1, row.sales_days) if row.total_quantity else 0
-
-        # Get top categories
-        top_categories_query = text("""
+        WITH recent_sales AS (
             SELECT 
+                p.sid as product_sid,
+                p.name as product_name,
                 c.name as category_name,
-                SUM(s.sold_qty) as quantity,
-                SUM(s.sold_qty * s.sold_price) as revenue
+                SUM(s.sold_qty) as total_quantity,
+                SUM(s.sold_qty * s.sold_price) as total_revenue,
+                COUNT(DISTINCT DATE(s.sold_at)) as sale_days,
+                MAX(s.sold_at) as last_sale_date
             FROM 
                 sale s
             JOIN 
@@ -503,38 +334,249 @@ async def get_dashboard_metrics(
                 warehouseitem wi ON si.warehouse_item_sid = wi.sid
             JOIN 
                 product p ON wi.product_sid = p.sid
-            JOIN
+            JOIN 
                 category c ON p.category_sid = c.sid
             WHERE 
                 s.sold_at >= :min_date
             GROUP BY 
-                c.name
-            ORDER BY 
-                revenue DESC
-            LIMIT 5
-        """)
+                p.sid, p.name, c.name
+        ),
+        inventory_status AS (
+            SELECT 
+                p.sid as product_sid,
+                COALESCE(SUM(wi.quantity), 0) as warehouse_qty,
+                COALESCE(SUM(si.quantity), 0) as store_qty,
+                MIN(wi.expire_date) as nearest_expiry
+            FROM 
+                product p
+            LEFT JOIN 
+                warehouseitem wi ON p.sid = wi.product_sid AND wi.status = 'IN_STOCK'
+            LEFT JOIN 
+                storeitem si ON wi.sid = si.warehouse_item_sid AND si.status = 'ACTIVE'
+            GROUP BY 
+                p.sid
+        )
+        SELECT 
+            rs.product_sid,
+            rs.product_name,
+            rs.category_name,
+            rs.total_quantity,
+            rs.total_revenue,
+            rs.sale_days,
+            rs.last_sale_date,
+            inv.warehouse_qty,
+            inv.store_qty,
+            inv.nearest_expiry,
+            CASE 
+                WHEN rs.sale_days > 0 THEN rs.total_quantity / rs.sale_days::float 
+                ELSE 0 
+            END as avg_daily_sales,
+            CASE 
+                WHEN rs.sale_days > 0 AND (inv.warehouse_qty + inv.store_qty) > 0 
+                THEN (inv.warehouse_qty + inv.store_qty) / (rs.total_quantity / rs.sale_days::float)
+                ELSE 0 
+            END as days_of_supply
+        FROM 
+            recent_sales rs
+        JOIN 
+            inventory_status inv ON rs.product_sid = inv.product_sid
+        ORDER BY 
+            rs.total_revenue DESC
+    """)
 
-        categories_result = await db.execute(top_categories_query, {"min_date": min_date})
-        categories_rows = categories_result.fetchall()
+    min_date = datetime.now() - timedelta(days=30)
+    result = await db.execute(query, {"min_date": min_date})
+    rows = result.fetchall()
 
-        top_categories = [
-            {
-                "category_name": row.category_name,
-                "quantity": float(row.quantity),
-                "revenue": float(row.revenue)
-            }
-            for row in categories_rows
-        ]
+    insights = {
+        "slow_moving_products": [],
+        "out_of_stock_risks": [],
+        "overstock_products": [],
+        "expiring_products": [],
+        "top_performers": [],
+        "recommendations": []
+    }
 
-        return {
-            "product_count": row.product_count or 0,
-            "category_count": row.category_count or 0,
-            "total_quantity": float(row.total_quantity) if row.total_quantity else 0,
-            "total_revenue": float(row.total_revenue) if row.total_revenue else 0,
-            "avg_daily_sales": float(avg_daily_sales),
-            "warehouse_items_count": row.warehouse_items_count or 0,
-            "warehouse_total_quantity": float(row.warehouse_total_quantity) if row.warehouse_total_quantity else 0,
-            "top_categories": top_categories
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching dashboard metrics: {str(e)}")
+    for row in rows[:10]:
+        insights["top_performers"].append({
+            "product_name": row.product_name,
+            "category": row.category_name,
+            "revenue": float(row.total_revenue),
+            "quantity_sold": float(row.total_quantity)
+        })
+
+    for row in rows:
+        if row.avg_daily_sales < 1 and row.avg_daily_sales > 0:
+            insights["slow_moving_products"].append({
+                "product_name": row.product_name,
+                "category": row.category_name,
+                "avg_daily_sales": float(row.avg_daily_sales),
+                "current_stock": int(row.warehouse_qty + row.store_qty)
+            })
+
+        if row.days_of_supply < 7 and row.days_of_supply > 0:
+            insights["out_of_stock_risks"].append({
+                "product_name": row.product_name,
+                "category": row.category_name,
+                "days_of_supply": float(row.days_of_supply),
+                "current_stock": int(row.warehouse_qty + row.store_qty)
+            })
+
+        if row.days_of_supply > 60:
+            insights["overstock_products"].append({
+                "product_name": row.product_name,
+                "category": row.category_name,
+                "days_of_supply": float(row.days_of_supply),
+                "current_stock": int(row.warehouse_qty + row.store_qty)
+            })
+
+        if row.nearest_expiry:
+            days_until_expiry = (row.nearest_expiry - datetime.now().date()).days
+            if days_until_expiry <= 14:
+                insights["expiring_products"].append({
+                    "product_name": row.product_name,
+                    "category": row.category_name,
+                    "days_until_expiry": days_until_expiry,
+                    "expire_date": row.nearest_expiry.strftime("%Y-%m-%d")
+                })
+
+    if insights["slow_moving_products"]:
+        insights["recommendations"].append({
+            "type": "promotion",
+            "title": "Рекомендуется провести акцию",
+            "description": f"У вас {len(insights['slow_moving_products'])} медленно продающихся товаров",
+            "products": [p["product_name"] for p in insights["slow_moving_products"][:5]]
+        })
+
+    if insights["out_of_stock_risks"]:
+        insights["recommendations"].append({
+            "type": "restock",
+            "title": "Требуется пополнение запасов",
+            "description": f"{len(insights['out_of_stock_risks'])} товаров могут закончиться в ближайшую неделю",
+            "products": [p["product_name"] for p in insights["out_of_stock_risks"][:5]]
+        })
+
+    if insights["expiring_products"]:
+        insights["recommendations"].append({
+            "type": "urgent",
+            "title": "Срочная реализация",
+            "description": f"{len(insights['expiring_products'])} товаров с истекающим сроком годности",
+            "products": [p["product_name"] for p in insights["expiring_products"][:5]]
+        })
+
+    return insights
+
+
+@router.get("/optimization-suggestions", response_model=List[Dict[str, Any]])
+async def get_optimization_suggestions(
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+):
+    query = text("""
+        WITH product_metrics AS (
+            SELECT 
+                p.sid,
+                p.name,
+                c.name as category_name,
+                COALESCE(SUM(s.sold_qty), 0) as total_sold,
+                COALESCE(SUM(s.sold_qty * s.sold_price), 0) as total_revenue,
+                COALESCE(AVG(s.sold_price), p.default_price) as avg_price,
+                COALESCE(SUM(wi.quantity), 0) as warehouse_stock,
+                COALESCE(SUM(si.quantity), 0) as store_stock,
+                COUNT(DISTINCT DATE(s.sold_at)) as sale_days
+            FROM 
+                product p
+            JOIN 
+                category c ON p.category_sid = c.sid
+            LEFT JOIN 
+                warehouseitem wi ON p.sid = wi.product_sid AND wi.status = 'IN_STOCK'
+            LEFT JOIN 
+                storeitem si ON wi.sid = si.warehouse_item_sid AND si.status = 'ACTIVE'
+            LEFT JOIN 
+                sale s ON si.sid = s.store_item_sid AND s.sold_at >= :min_date
+            GROUP BY 
+                p.sid, p.name, c.name, p.default_price
+        )
+        SELECT 
+            *,
+            CASE 
+                WHEN sale_days > 0 THEN total_sold::float / sale_days 
+                ELSE 0 
+            END as avg_daily_sales,
+            CASE 
+                WHEN total_sold > 0 THEN total_revenue::float / total_sold 
+                ELSE avg_price 
+            END as actual_avg_price,
+            warehouse_stock + store_stock as total_stock
+        FROM 
+            product_metrics
+        WHERE 
+            warehouse_stock > 0 OR store_stock > 0
+        ORDER BY 
+            total_revenue DESC
+    """)
+
+    min_date = datetime.now() - timedelta(days=30)
+    result = await db.execute(query, {"min_date": min_date})
+    rows = result.fetchall()
+
+    suggestions = []
+
+    for row in rows:
+        product_suggestions = []
+
+        if row.warehouse_stock > 0 and row.store_stock == 0 and row.avg_daily_sales > 0:
+            product_suggestions.append({
+                "type": "move_to_store",
+                "priority": "high",
+                "action": "Переместить в магазин",
+                "reason": "Товар есть на складе, но отсутствует в магазине",
+                "recommended_quantity": min(row.warehouse_stock, int(row.avg_daily_sales * 14))
+            })
+
+        if row.total_stock > 0 and row.avg_daily_sales > 0:
+            days_of_supply = row.total_stock / row.avg_daily_sales
+
+            if days_of_supply > 90:
+                discount_percentage = min(30, int((days_of_supply - 90) / 10) * 5)
+                product_suggestions.append({
+                    "type": "discount",
+                    "priority": "medium",
+                    "action": f"Применить скидку {discount_percentage}%",
+                    "reason": f"Избыточные запасы на {days_of_supply:.0f} дней",
+                    "expected_impact": "Ускорение оборачиваемости товара"
+                })
+
+            elif days_of_supply < 7:
+                order_quantity = int(row.avg_daily_sales * 30)
+                product_suggestions.append({
+                    "type": "reorder",
+                    "priority": "high",
+                    "action": f"Заказать {order_quantity} единиц",
+                    "reason": f"Запасов осталось на {days_of_supply:.1f} дней",
+                    "expected_impact": "Предотвращение дефицита товара"
+                })
+
+        if row.total_stock > 0 and row.sale_days == 0:
+            product_suggestions.append({
+                "type": "promotion",
+                "priority": "high",
+                "action": "Запустить промо-кампанию",
+                "reason": "Товар не продавался последние 30 дней",
+                "expected_impact": "Стимулирование первичного спроса"
+            })
+
+        if product_suggestions:
+            suggestions.append({
+                "product_name": row.name,
+                "category": row.category_name,
+                "current_metrics": {
+                    "warehouse_stock": int(row.warehouse_stock),
+                    "store_stock": int(row.store_stock),
+                    "avg_daily_sales": float(row.avg_daily_sales),
+                    "total_revenue_30d": float(row.total_revenue)
+                },
+                "suggestions": product_suggestions
+            })
+
+    return suggestions[:20]
