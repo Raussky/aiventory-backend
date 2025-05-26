@@ -79,7 +79,6 @@ async def get_store_items(
                     "created_by_sid": d.created_by_sid,
                 })
 
-        # Get full category information
         category_response = None
         if item.warehouse_item.product.category:
             category_response = CategoryResponse(
@@ -121,11 +120,10 @@ async def get_store_items(
 async def get_removed_items(
         skip: int = 0,
         limit: int = 100,
-        reason: Optional[str] = None,  # 'expired' or 'manual'
+        reason: Optional[str] = None,
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
 ):
-    """Get items that were removed from store (expired or manually removed)"""
     query = (
         select(StoreItem)
         .options(
@@ -157,10 +155,8 @@ async def get_removed_items(
 
     response = []
     for item in items:
-        # Calculate loss
         lost_value = item.price * item.quantity
 
-        # Get removal reason
         if item.status == StoreItemStatus.EXPIRED:
             removal_reason = "Истек срок годности"
         else:
@@ -179,7 +175,7 @@ async def get_removed_items(
             quantity=item.quantity,
             price=item.price,
             moved_at=item.moved_at,
-            removed_at=item.moved_at,  # When it was removed
+            removed_at=item.moved_at,
             status=item.status,
             product=ProductResponse(
                 sid=item.warehouse_item.product.sid,
@@ -240,7 +236,6 @@ async def record_sale(
             detail=f"Not enough quantity available (requested: {sale.sold_qty}, available: {store_item.quantity})"
         )
 
-    # Calculate actual price with discounts
     current_discounts = []
     for d in store_item.discounts:
         if d.starts_at <= datetime.now(timezone.utc) <= d.ends_at:
@@ -283,7 +278,118 @@ async def record_sale(
         })
     )
 
-    # Prepare category response
+    category_response = None
+    if store_item.warehouse_item.product.category:
+        category_response = CategoryResponse(
+            sid=store_item.warehouse_item.product.category.sid,
+            name=store_item.warehouse_item.product.category.name
+        )
+
+    return SaleResponse(
+        sid=new_sale.sid,
+        store_item_sid=new_sale.store_item_sid,
+        sold_qty=new_sale.sold_qty,
+        sold_price=new_sale.sold_price,
+        sold_at=new_sale.sold_at,
+        cashier_sid=new_sale.cashier_sid,
+        product=ProductResponse(
+            sid=store_item.warehouse_item.product.sid,
+            name=store_item.warehouse_item.product.name,
+            category_sid=store_item.warehouse_item.product.category_sid,
+            barcode=store_item.warehouse_item.product.barcode,
+            default_unit=store_item.warehouse_item.product.default_unit,
+            default_price=store_item.warehouse_item.product.default_price,
+            currency=store_item.warehouse_item.product.currency.value if store_item.warehouse_item.product.currency else None,
+            storage_duration=store_item.warehouse_item.product.storage_duration,
+            storage_duration_type=store_item.warehouse_item.product.storage_duration_type.value if store_item.warehouse_item.product.storage_duration_type else None,
+            category=category_response
+        ),
+        total_amount=new_sale.sold_qty * new_sale.sold_price
+    )
+
+
+@router.post("/sales-by-barcode", response_model=SaleResponse)
+async def record_sale_by_barcode(
+        barcode: str,
+        sold_qty: int,
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+        redis: Redis = Depends(get_redis),
+):
+    store_item_query = await db.execute(
+        select(StoreItem)
+        .options(
+            selectinload(StoreItem.warehouse_item)
+            .selectinload(WarehouseItem.product)
+            .selectinload(Product.category),
+            selectinload(StoreItem.discounts)
+        )
+        .join(WarehouseItem)
+        .join(Product)
+        .join(Upload)
+        .where(
+            Product.barcode == barcode,
+            StoreItem.status == StoreItemStatus.ACTIVE,
+            Upload.user_sid == current_user.sid
+        )
+        .order_by(StoreItem.warehouse_item.has(WarehouseItem.expire_date).asc())
+    )
+    store_item = store_item_query.scalar_one_or_none()
+
+    if not store_item:
+        raise HTTPException(
+            status_code=404,
+            detail="Active store item with this barcode not found"
+        )
+
+    if store_item.quantity < sold_qty:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Not enough quantity available (requested: {sold_qty}, available: {store_item.quantity})"
+        )
+
+    current_discounts = []
+    for d in store_item.discounts:
+        if d.starts_at <= datetime.now(timezone.utc) <= d.ends_at:
+            current_discounts.append(d)
+
+    final_price = store_item.price
+    if current_discounts:
+        max_discount = max(d.percentage for d in current_discounts)
+        final_price = store_item.price * (1 - max_discount / 100)
+
+    new_sale = Sale(
+        sid=Base.generate_sid(),
+        store_item_sid=store_item.sid,
+        sold_qty=sold_qty,
+        sold_price=final_price,
+        sold_at=datetime.now(timezone.utc),
+        cashier_sid=current_user.sid,
+    )
+
+    store_item.quantity -= sold_qty
+
+    if store_item.quantity == 0:
+        store_item.status = StoreItemStatus.REMOVED
+
+    db.add(new_sale)
+    await db.commit()
+    await db.refresh(new_sale)
+
+    await redis.delete(f"store:items:{current_user.sid}:*")
+
+    await redis.publish(
+        f"sales:{current_user.sid}",
+        json.dumps({
+            "type": "new_sale",
+            "product_name": store_item.warehouse_item.product.name,
+            "quantity": sold_qty,
+            "price": final_price,
+            "total": sold_qty * final_price,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+    )
+
     category_response = None
     if store_item.warehouse_item.product.category:
         category_response = CategoryResponse(
@@ -476,7 +582,6 @@ async def mark_as_expired(
 
     await redis.delete(f"store:items:{current_user.sid}:*")
 
-    # Return with full category info
     category_response = None
     if store_item.warehouse_item.product.category:
         category_response = CategoryResponse(
@@ -558,7 +663,6 @@ async def remove_from_store(
 
     await redis.delete(f"store:items:{current_user.sid}:*")
 
-    # Return with full category info
     category_response = None
     if store_item.warehouse_item.product.category:
         category_response = CategoryResponse(
@@ -743,8 +847,8 @@ async def get_store_reports(
                 "date": row.date.isoformat(),
                 "product_name": row.product_name,
                 "category_name": row.category_name,
-                "quantity": row.quantity,
-                "revenue": row.revenue
+                "quantity": float(row.quantity) if row.quantity else 0,
+                "revenue": float(row.revenue) if row.revenue else 0
             }
             for row in sales_data
         ],
@@ -752,14 +856,14 @@ async def get_store_reports(
             {
                 "product_name": row.product_name,
                 "category_name": row.category_name,
-                "discount_percentage": row.discount_percentage,
+                "discount_percentage": float(row.discount_percentage) if row.discount_percentage else 0,
                 "start_date": row.start_date.isoformat(),
                 "end_date": row.end_date.isoformat(),
-                "sales_count": row.sales_count,
-                "sold_quantity": row.sold_quantity,
-                "discounted_revenue": row.discounted_revenue,
-                "regular_revenue": row.regular_revenue,
-                "savings": row.regular_revenue - row.discounted_revenue if row.regular_revenue and row.discounted_revenue else 0
+                "sales_count": int(row.sales_count) if row.sales_count else 0,
+                "sold_quantity": float(row.sold_quantity) if row.sold_quantity else 0,
+                "discounted_revenue": float(row.discounted_revenue) if row.discounted_revenue else 0,
+                "regular_revenue": float(row.regular_revenue) if row.regular_revenue else 0,
+                "savings": float(row.regular_revenue - row.discounted_revenue) if row.regular_revenue and row.discounted_revenue else 0
             }
             for row in discounts_data
         ],
@@ -767,23 +871,23 @@ async def get_store_reports(
             {
                 "product_name": row.product_name,
                 "category_name": row.category_name,
-                "removed_quantity": row.removed_quantity,
-                "removed_value": row.removed_value,
-                "removed_items_count": row.removed_items_count,
+                "removed_quantity": float(row.removed_quantity) if row.removed_quantity else 0,
+                "removed_value": float(row.removed_value) if row.removed_value else 0,
+                "removed_items_count": int(row.removed_items_count) if row.removed_items_count else 0,
                 "removal_reason": "Истек срок годности" if row.removal_reason == "EXPIRED" else "Убран вручную"
             }
             for row in removed_data
         ],
         "summary": {
-            "total_sales": sum(row.revenue for row in sales_data) if sales_data else 0,
-            "total_items_sold": sum(row.quantity for row in sales_data) if sales_data else 0,
-            "total_removed_value": sum(row.removed_value for row in removed_data) if removed_data else 0,
-            "total_removed_items": sum(row.removed_quantity for row in removed_data) if removed_data else 0,
-            "total_discount_savings": sum(
+            "total_sales": float(sum(row.revenue for row in sales_data)) if sales_data else 0,
+            "total_items_sold": float(sum(row.quantity for row in sales_data)) if sales_data else 0,
+            "total_removed_value": float(sum(row.removed_value for row in removed_data)) if removed_data else 0,
+            "total_removed_items": float(sum(row.removed_quantity for row in removed_data)) if removed_data else 0,
+            "total_discount_savings": float(sum(
                 (row.regular_revenue - row.discounted_revenue)
                 for row in discounts_data
                 if row.regular_revenue and row.discounted_revenue
-            ) if discounts_data else 0
+            )) if discounts_data else 0
         }
     }
 
