@@ -81,7 +81,9 @@ async def get_forecast(
         db: AsyncSession = Depends(get_db),
 ):
     product_query = await db.execute(
-        select(Product).where(Product.sid == product_sid)
+        select(Product)
+        .options(selectinload(Product.category))
+        .where(Product.sid == product_sid)
     )
     product = product_query.scalar_one_or_none()
 
@@ -91,18 +93,55 @@ async def get_forecast(
     if not refresh:
         predictions_query = await db.execute(
             select(Prediction)
+            .options(selectinload(Prediction.product).selectinload(Product.category))
             .where(
                 Prediction.product_sid == product_sid,
                 Prediction.timeframe == timeframe,
                 Prediction.period_start >= datetime.now().date()
             )
-            .order_by(Prediction.generated_at.desc())
+            .order_by(Prediction.period_start.asc())
             .limit(periods)
         )
         predictions = predictions_query.scalars().all()
 
         if predictions and len(predictions) == periods:
-            return predictions
+            response_predictions = []
+            for pred in predictions:
+                category_response = None
+                if pred.product.category:
+                    category_response = CategoryResponse(
+                        sid=pred.product.category.sid,
+                        name=pred.product.category.name
+                    )
+
+                product_response = ProductResponse(
+                    sid=pred.product.sid,
+                    name=pred.product.name,
+                    category_sid=pred.product.category_sid,
+                    barcode=pred.product.barcode,
+                    default_unit=pred.product.default_unit,
+                    default_price=pred.product.default_price,
+                    currency=pred.product.currency.value if pred.product.currency else None,
+                    storage_duration=pred.product.storage_duration,
+                    storage_duration_type=pred.product.storage_duration_type.value if pred.product.storage_duration_type else None,
+                    category=category_response
+                )
+
+                response_predictions.append(PredictionResponse(
+                    sid=pred.sid,
+                    product_sid=pred.product_sid,
+                    timeframe=pred.timeframe,
+                    period_start=pred.period_start,
+                    period_end=pred.period_end,
+                    forecast_qty=pred.forecast_qty,
+                    generated_at=pred.generated_at,
+                    model_version=pred.model_version,
+                    product=product_response,
+                    forecast_qty_lower=pred.forecast_qty * 0.8,
+                    forecast_qty_upper=pred.forecast_qty * 1.2
+                ))
+
+            return response_predictions
 
     prediction_service = PredictionService(db)
     forecasts = await prediction_service.generate_forecast(
@@ -117,9 +156,52 @@ async def get_forecast(
             detail="Could not generate forecast. Not enough sales data."
         )
 
-    predictions = await prediction_service.save_forecast(forecasts)
+    saved_predictions = await prediction_service.save_forecast(forecasts)
 
-    return predictions
+    product_query = await db.execute(
+        select(Product)
+        .options(selectinload(Product.category))
+        .where(Product.sid == product_sid)
+    )
+    product = product_query.scalar_one_or_none()
+
+    category_response = None
+    if product.category:
+        category_response = CategoryResponse(
+            sid=product.category.sid,
+            name=product.category.name
+        )
+
+    product_response = ProductResponse(
+        sid=product.sid,
+        name=product.name,
+        category_sid=product.category_sid,
+        barcode=product.barcode,
+        default_unit=product.default_unit,
+        default_price=product.default_price,
+        currency=product.currency.value if product.currency else None,
+        storage_duration=product.storage_duration,
+        storage_duration_type=product.storage_duration_type.value if product.storage_duration_type else None,
+        category=category_response
+    )
+
+    response_predictions = []
+    for pred in saved_predictions:
+        response_predictions.append(PredictionResponse(
+            sid=pred["sid"],
+            product_sid=pred["product_sid"],
+            timeframe=pred["timeframe"],
+            period_start=pred["period_start"],
+            period_end=pred["period_end"],
+            forecast_qty=pred["forecast_qty"],
+            generated_at=pred["generated_at"],
+            model_version=pred["model_version"],
+            product=product_response,
+            forecast_qty_lower=pred.get("forecast_qty_lower", pred["forecast_qty"] * 0.8),
+            forecast_qty_upper=pred.get("forecast_qty_upper", pred["forecast_qty"] * 1.2)
+        ))
+
+    return response_predictions
 
 
 @router.get("/stats", response_model=Dict[str, Any])
@@ -152,7 +234,7 @@ async def get_prediction_stats(
             p.sid as product_sid,
             c.name as category_name,
             c.sid as category_sid,
-            SUM(s.sold_qtySUM(s.sold_qty) as quantity,
+            SUM(s.sold_qty) as quantity,
             SUM(s.sold_qty * s.sold_price) as revenue
         FROM 
             sale s
