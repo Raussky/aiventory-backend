@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
 from typing import List, Dict, Any, Optional
-import datetime
+from datetime import datetime, timedelta, date, timezone
 
 from app.db.session import get_db
 from app.models.users import User
@@ -19,7 +19,6 @@ from app.services.file_parser import detect_and_parse_file
 from app.services.barcode import decode_barcode_from_base64
 from app.db.redis import get_redis
 from app.services.pricing import calculate_store_price, suggest_discount, suggest_warehouse_action
-from datetime import datetime, timedelta, timezone
 
 router = APIRouter()
 
@@ -35,7 +34,7 @@ async def upload_file(
             sid=Base.generate_sid(),
             user_sid=current_user.sid,
             file_name=file.filename,
-            uploaded_at=datetime.datetime.utcnow(),
+            uploaded_at=datetime.utcnow(),
             rows_imported=0,
         )
         db.add(upload)
@@ -129,7 +128,7 @@ async def upload_file(
                             oldest_expire_date = existing_item.expire_date
 
                         if existing_item.expire_date:
-                            days_until_expiry = (existing_item.expire_date - datetime.date.today()).days
+                            days_until_expiry = (existing_item.expire_date - date.today()).days
                             if days_until_expiry <= 7:
                                 existing_item.urgency_level = UrgencyLevel.CRITICAL
                             elif days_until_expiry <= 14:
@@ -150,14 +149,14 @@ async def upload_file(
             expire_date = None
             if record.get('expire_date'):
                 if isinstance(record.get('expire_date'), str):
-                    expire_date = datetime.datetime.strptime(record.get('expire_date'), '%Y-%m-%d').date()
+                    expire_date = datetime.strptime(record.get('expire_date'), '%Y-%m-%d').date()
                 else:
                     expire_date = record.get('expire_date')
 
-            received_at = datetime.date.today()
+            received_at = date.today()
             if record.get('received_at'):
                 if isinstance(record.get('received_at'), str):
-                    received_at = datetime.datetime.strptime(record.get('received_at'), '%Y-%m-%d').date()
+                    received_at = datetime.strptime(record.get('received_at'), '%Y-%m-%d').date()
                 else:
                     received_at = record.get('received_at')
 
@@ -236,10 +235,10 @@ async def get_warehouse_items(
         query = query.where(WarehouseItem.upload_sid == upload_sid)
 
     if expire_soon:
-        expiry_threshold = datetime.date.today() + datetime.timedelta(days=7)
+        expiry_threshold = date.today() + timedelta(days=7)
         query = query.where(
             WarehouseItem.expire_date <= expiry_threshold,
-            WarehouseItem.expire_date >= datetime.date.today(),
+            WarehouseItem.expire_date >= date.today(),
             WarehouseItem.status == WarehouseItemStatus.IN_STOCK
         )
 
@@ -431,7 +430,7 @@ async def move_to_store(
             warehouse_item_sid=warehouse_item.sid,
             quantity=quantity,
             price=final_price,
-            moved_at=datetime.datetime.utcnow(),
+            moved_at=datetime.utcnow(),
             status=StoreItemStatus.ACTIVE,
         )
         db.add(store_item)
@@ -557,7 +556,7 @@ async def move_to_store_by_barcode(
             warehouse_item_sid=warehouse_item.sid,
             quantity=quantity,
             price=final_price,
-            moved_at=datetime.datetime.utcnow(),
+            moved_at=datetime.utcnow(),
             status=StoreItemStatus.ACTIVE,
         )
         db.add(store_item)

@@ -5,10 +5,12 @@ from enum import Enum
 
 from app.schemas.inventory import ProductResponse
 
+
 class StoreItemStatus(str, Enum):
     ACTIVE = "active"
     EXPIRED = "expired"
     REMOVED = "removed"
+
 
 class StoreItemBase(BaseModel):
     warehouse_item_sid: str
@@ -27,8 +29,10 @@ class StoreItemBase(BaseModel):
             raise ValueError('Price must be positive')
         return v
 
+
 class StoreItemCreate(StoreItemBase):
     pass
+
 
 class StoreItemResponse(StoreItemBase):
     sid: str
@@ -43,13 +47,34 @@ class StoreItemResponse(StoreItemBase):
     class Config:
         from_attributes = True
 
-class RemovedItemsResponse(StoreItemResponse):
+
+class RemovedItemsBase(BaseModel):
+    warehouse_item_sid: str
+    quantity: int = Field(..., ge=0)
+    price: float = Field(..., gt=0)
+
+    @validator('price')
+    def price_must_be_positive(cls, v):
+        if v <= 0:
+            raise ValueError('Price must be positive')
+        return v
+
+
+class RemovedItemsResponse(RemovedItemsBase):
+    sid: str
+    moved_at: datetime
     removed_at: datetime
+    status: StoreItemStatus
+    product: Optional[ProductResponse] = None
+    expire_date: Optional[datetime] = None
+    batch_code: Optional[str] = None
+    days_until_expiry: Optional[int] = None
     lost_value: float
     removal_reason: str
 
     class Config:
         from_attributes = True
+
 
 class DiscountBase(BaseModel):
     store_item_sid: str
@@ -63,8 +88,10 @@ class DiscountBase(BaseModel):
             raise ValueError('End date must be after start date')
         return v
 
+
 class DiscountCreate(DiscountBase):
     pass
+
 
 class DiscountResponse(DiscountBase):
     sid: str
@@ -73,14 +100,17 @@ class DiscountResponse(DiscountBase):
     class Config:
         from_attributes = True
 
+
 class SaleBase(BaseModel):
     store_item_sid: str
     sold_qty: int = Field(..., gt=0)
     sold_price: float = Field(..., ge=0)
     ignore_discount: Optional[bool] = False
 
+
 class SaleCreate(SaleBase):
     pass
+
 
 class SaleResponse(SaleBase):
     sid: str
@@ -91,6 +121,7 @@ class SaleResponse(SaleBase):
 
     class Config:
         from_attributes = True
+
 
 class StoreItemFilter(BaseModel):
     status: Optional[StoreItemStatus] = None
