@@ -69,7 +69,7 @@ async def register(
         sid=Base.generate_sid(),
         email=user_in.email,
         password_hash=get_password_hash(user_in.password),
-        is_verified=False,
+        is_verified=True,
     )
     db.add(user)
     await db.commit()
