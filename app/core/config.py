@@ -1,4 +1,3 @@
-# app/core/config.py
 from pydantic_settings import BaseSettings
 from typing import Optional, Dict, Any, List
 
@@ -8,12 +7,15 @@ class Settings(BaseSettings):
     SECRET_KEY: str
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 дней
 
-    # PostgreSQL
-    POSTGRES_SERVER: str
+    # Database URL (приоритет)
+    DATABASE_URL: Optional[str] = None
+
+    # PostgreSQL (для обратной совместимости)
+    POSTGRES_SERVER: Optional[str] = None
     POSTGRES_PORT: str = "5432"
-    POSTGRES_USER: str
-    POSTGRES_PASSWORD: str
-    POSTGRES_DB: str
+    POSTGRES_USER: Optional[str] = None
+    POSTGRES_PASSWORD: Optional[str] = None
+    POSTGRES_DB: Optional[str] = None
     SQLALCHEMY_DATABASE_URI: Optional[str] = None
 
     # Redis
@@ -43,7 +45,12 @@ class Settings(BaseSettings):
 
     def __init__(self, **data: Any):
         super().__init__(**data)
-        self.SQLALCHEMY_DATABASE_URI = f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_SERVER}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        # Используем DATABASE_URL если он есть
+        if self.DATABASE_URL:
+            self.SQLALCHEMY_DATABASE_URI = self.DATABASE_URL
+        else:
+            # Иначе собираем из частей
+            self.SQLALCHEMY_DATABASE_URI = f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_SERVER}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
 
 
 settings = Settings()
