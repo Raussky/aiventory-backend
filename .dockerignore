@@ -1,0 +1,82 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+.env.local
+.env.*.local
+
+# Distribution / packaging
+.eggs/
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+nosetests.xml
+coverage.xml
+*.cover
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.override.yml
+Dockerfile
+.dockerignore
+
+# Git
+.git/
+.gitignore
+
+# Documentation
+docs/
+*.md
+
+# Logs
+logs/
+*.log
+
+# Database
+*.db
+*.sqlite3
+
+# Redis
+dump.rdb
+
+# Frontend (если есть)
+frontend/
+node_modules/
+
+# Временные файлы
+tmp/
+temp/
+
+# Скрипты
+*.sh
+
+# Nginx конфигурация (будет монтироваться как volume)
+nginx/
