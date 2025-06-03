@@ -25,11 +25,25 @@ async def get_dashboard_stats(
     sixty_days_ago = today - timedelta(days=60)
     expiry_threshold = today + timedelta(days=7)
 
-    total_products = await db.execute(
-        select(func.count(Product.id))
-    )
-    total_products_count = total_products.scalar()
+    # Общее количество уникальных продуктов
+    total_products_query = """
+        SELECT COUNT(DISTINCT p.sid)
+        FROM product p
+        WHERE EXISTS (
+            SELECT 1 FROM warehouseitem wi
+            JOIN upload u ON wi.upload_sid = u.sid
+            WHERE wi.product_sid = p.sid
+            AND u.user_sid = :user_sid
+        )
+    """
 
+    total_products_result = await db.execute(
+        text(total_products_query),
+        {"user_sid": current_user.sid}
+    )
+    total_products_count = total_products_result.scalar() or 0
+
+    # Продукты на складе
     warehouse_query = """
         SELECT COUNT(DISTINCT wi.product_sid)
         FROM warehouseitem wi
@@ -43,8 +57,9 @@ async def get_dashboard_stats(
         text(warehouse_query),
         {"user_sid": current_user.sid}
     )
-    products_in_warehouse = warehouse_result.scalar()
+    products_in_warehouse = warehouse_result.scalar() or 0
 
+    # Продукты в магазине
     store_query = """
         SELECT COUNT(DISTINCT wi.product_sid)
         FROM storeitem si
@@ -59,10 +74,11 @@ async def get_dashboard_stats(
         text(store_query),
         {"user_sid": current_user.sid}
     )
-    products_in_store = store_result.scalar()
+    products_in_store = store_result.scalar() or 0
 
+    # Товары с истекающим сроком
     expiring_query = """
-        SELECT COUNT(DISTINCT wi.product_sid)
+        SELECT COUNT(DISTINCT subquery.product_sid)
         FROM (
             SELECT wi.product_sid
             FROM warehouseitem wi
@@ -75,16 +91,16 @@ async def get_dashboard_stats(
 
             UNION
 
-            SELECT wi.product_sid
+            SELECT wi2.product_sid
             FROM storeitem si
-            JOIN warehouseitem wi ON si.warehouse_item_sid = wi.sid
-            JOIN upload u ON wi.upload_sid = u.sid
+            JOIN warehouseitem wi2 ON si.warehouse_item_sid = wi2.sid
+            JOIN upload u ON wi2.upload_sid = u.sid
             WHERE si.status = 'ACTIVE' 
             AND si.quantity > 0
-            AND wi.expire_date <= :expiry_threshold
-            AND wi.expire_date > :today
+            AND wi2.expire_date <= :expiry_threshold
+            AND wi2.expire_date > :today
             AND u.user_sid = :user_sid
-        ) AS expiring_products
+        ) AS subquery
     """
 
     expiring_result = await db.execute(
@@ -95,8 +111,9 @@ async def get_dashboard_stats(
             "today": today
         }
     )
-    products_expiring_soon = expiring_result.scalar()
+    products_expiring_soon = expiring_result.scalar() or 0
 
+    # Выручка за последние 30 дней
     revenue_30_days_query = """
         SELECT COALESCE(SUM(s.sold_qty * s.sold_price), 0) as revenue
         FROM sale s
@@ -113,18 +130,17 @@ async def get_dashboard_stats(
     )
     total_revenue_last_30_days = float(revenue_result.scalar() or 0)
 
-    revenue_60_to_30_days_query = """
-        SELECT COALESCE(SUM(s.sold_qty * s.sold_price), 0) as revenue
-        FROM sale s
-        JOIN storeitem si ON s.store_item_sid = si.sid
-        JOIN warehouseitem wi ON si.warehouse_item_sid = wi.sid
-        JOIN upload u ON wi.upload_sid = u.sid
-        WHERE s.sold_at >= :start_date AND s.sold_at < :end_date
-        AND u.user_sid = :user_sid
-    """
-
+    # Выручка за предыдущие 30 дней
     prev_revenue_result = await db.execute(
-        text(revenue_60_to_30_days_query),
+        text("""
+            SELECT COALESCE(SUM(s.sold_qty * s.sold_price), 0) as revenue
+            FROM sale s
+            JOIN storeitem si ON s.store_item_sid = si.sid
+            JOIN warehouseitem wi ON si.warehouse_item_sid = wi.sid
+            JOIN upload u ON wi.upload_sid = u.sid
+            WHERE s.sold_at >= :start_date AND s.sold_at < :end_date
+            AND u.user_sid = :user_sid
+        """),
         {
             "start_date": sixty_days_ago,
             "end_date": thirty_days_ago,
@@ -137,22 +153,22 @@ async def get_dashboard_stats(
     if prev_revenue > 0:
         revenue_change = ((total_revenue_last_30_days - prev_revenue) / prev_revenue) * 100
 
-    sales_30_days_query = """
-        SELECT COUNT(*) as sales_count
-        FROM sale s
-        JOIN storeitem si ON s.store_item_sid = si.sid
-        JOIN warehouseitem wi ON si.warehouse_item_sid = wi.sid
-        JOIN upload u ON wi.upload_sid = u.sid
-        WHERE s.sold_at >= :start_date
-        AND u.user_sid = :user_sid
-    """
-
+    # Количество продаж за 30 дней
     sales_result = await db.execute(
-        text(sales_30_days_query),
+        text("""
+            SELECT COUNT(*) as sales_count
+            FROM sale s
+            JOIN storeitem si ON s.store_item_sid = si.sid
+            JOIN warehouseitem wi ON si.warehouse_item_sid = wi.sid
+            JOIN upload u ON wi.upload_sid = u.sid
+            WHERE s.sold_at >= :start_date
+            AND u.user_sid = :user_sid
+        """),
         {"start_date": thirty_days_ago, "user_sid": current_user.sid}
     )
     total_sales_last_30_days = int(sales_result.scalar() or 0)
 
+    # Продажи за предыдущие 30 дней
     prev_sales_result = await db.execute(
         text("""
             SELECT COUNT(*) as sales_count
@@ -175,6 +191,7 @@ async def get_dashboard_stats(
     if prev_sales > 0:
         sales_change = ((total_sales_last_30_days - prev_sales) / prev_sales) * 100
 
+    # Средний чек
     avg_check = 0
     if total_sales_last_30_days > 0:
         avg_check = total_revenue_last_30_days / total_sales_last_30_days
@@ -187,7 +204,8 @@ async def get_dashboard_stats(
     if prev_avg_check > 0:
         avg_check_change = ((avg_check - prev_avg_check) / prev_avg_check) * 100
 
-    total_store_items_query = """
+    # Конверсия (процент проданных товаров от перемещенных в магазин)
+    store_items_query = """
         SELECT COUNT(DISTINCT si.sid) as total_items
         FROM storeitem si
         JOIN warehouseitem wi ON si.warehouse_item_sid = wi.sid
@@ -197,15 +215,33 @@ async def get_dashboard_stats(
     """
 
     store_items_result = await db.execute(
-        text(total_store_items_query),
+        text(store_items_query),
         {"start_date": thirty_days_ago, "user_sid": current_user.sid}
     )
     total_store_items = int(store_items_result.scalar() or 0)
 
+    # Уникальные товары, которые были проданы
+    sold_items_query = """
+        SELECT COUNT(DISTINCT si.sid) as sold_items
+        FROM sale s
+        JOIN storeitem si ON s.store_item_sid = si.sid
+        JOIN warehouseitem wi ON si.warehouse_item_sid = wi.sid
+        JOIN upload u ON wi.upload_sid = u.sid
+        WHERE s.sold_at >= :start_date
+        AND u.user_sid = :user_sid
+    """
+
+    sold_items_result = await db.execute(
+        text(sold_items_query),
+        {"start_date": thirty_days_ago, "user_sid": current_user.sid}
+    )
+    sold_items_count = int(sold_items_result.scalar() or 0)
+
     conversion_rate = 0
     if total_store_items > 0:
-        conversion_rate = (total_sales_last_30_days / total_store_items) * 100
+        conversion_rate = (sold_items_count / total_store_items) * 100
 
+    # Конверсия за предыдущий период
     prev_store_items_result = await db.execute(
         text("""
             SELECT COUNT(DISTINCT si.sid) as total_items
@@ -223,14 +259,31 @@ async def get_dashboard_stats(
     )
     prev_store_items = int(prev_store_items_result.scalar() or 0)
 
+    prev_sold_items_result = await db.execute(
+        text("""
+            SELECT COUNT(DISTINCT si.sid) as sold_items
+            FROM sale s
+            JOIN storeitem si ON s.store_item_sid = si.sid
+            JOIN warehouseitem wi ON si.warehouse_item_sid = wi.sid
+            JOIN upload u ON wi.upload_sid = u.sid
+            WHERE s.sold_at >= :start_date AND s.sold_at < :end_date
+            AND u.user_sid = :user_sid
+        """),
+        {
+            "start_date": sixty_days_ago,
+            "end_date": thirty_days_ago,
+            "user_sid": current_user.sid
+        }
+    )
+    prev_sold_items = int(prev_sold_items_result.scalar() or 0)
+
     prev_conversion_rate = 0
     if prev_store_items > 0:
-        prev_conversion_rate = (prev_sales / prev_store_items) * 100
+        prev_conversion_rate = (prev_sold_items / prev_store_items) * 100
 
-    conversion_change = 0
-    if prev_conversion_rate > 0:
-        conversion_change = conversion_rate - prev_conversion_rate
+    conversion_change = conversion_rate - prev_conversion_rate
 
+    # Распределение по категориям
     category_distribution_query = """
         WITH product_inventory AS (
             SELECT 
@@ -278,6 +331,7 @@ async def get_dashboard_stats(
         for row in category_data
     ]
 
+    # Топ-10 продуктов по продажам
     top_products_query = """
         SELECT 
             p.sid,
@@ -315,10 +369,10 @@ async def get_dashboard_stats(
     ]
 
     return {
-        "total_products": total_products_count or 0,
-        "products_in_warehouse": products_in_warehouse or 0,
-        "products_in_store": products_in_store or 0,
-        "products_expiring_soon": products_expiring_soon or 0,
+        "total_products": total_products_count,
+        "products_in_warehouse": products_in_warehouse,
+        "products_in_store": products_in_store,
+        "products_expiring_soon": products_expiring_soon,
         "total_revenue_last_30_days": total_revenue_last_30_days,
         "total_sales_last_30_days": total_sales_last_30_days,
         "revenue_change": round(revenue_change, 1),
