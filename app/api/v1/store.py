@@ -5,10 +5,8 @@ from sqlalchemy.orm import selectinload, joinedload
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta, timezone
 import json
-from redis.asyncio import Redis
 
 from app.db.session import get_db
-from app.db.redis import get_redis
 from app.models.users import User
 from app.models.inventory import StoreItem, StoreItemStatus, Discount, Sale, WarehouseItem, Product, Upload, Category
 from app.schemas.store import (
@@ -38,7 +36,6 @@ async def get_store_items(
         limit: int = 100,
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
-        redis: Redis = Depends(get_redis),
 ):
     query = (
         select(StoreItem)
@@ -142,7 +139,8 @@ async def get_removed_items(
         .join(Upload)
         .where(
             Upload.user_sid == current_user.sid,
-            StoreItem.status.in_([StoreItemStatus.EXPIRED, StoreItemStatus.REMOVED])
+            StoreItem.status.in_([StoreItemStatus.EXPIRED, StoreItemStatus.REMOVED]),
+            StoreItem.quantity > 0
         )
     )
 
@@ -209,7 +207,6 @@ async def record_sale(
         sale: SaleCreate,
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
-        redis: Redis = Depends(get_redis),
 ):
     store_item_query = await db.execute(
         select(StoreItem)
@@ -262,28 +259,9 @@ async def record_sale(
 
     store_item.quantity -= sale.sold_qty
 
-    if store_item.quantity == 0:
-        store_item.status = StoreItemStatus.REMOVED
-
     db.add(new_sale)
     await db.commit()
     await db.refresh(new_sale)
-
-    await redis.delete(f"store:items:{current_user.sid}:*")
-    await redis.delete(f"dashboard:stats:{current_user.sid}")
-    await redis.delete(f"store:reports:{current_user.sid}:*")
-
-    await redis.publish(
-        f"sales:{current_user.sid}",
-        json.dumps({
-            "type": "new_sale",
-            "product_name": store_item.warehouse_item.product.name,
-            "quantity": sale.sold_qty,
-            "price": final_price,
-            "total": sale.sold_qty * final_price,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        })
-    )
 
     category_response = None
     if store_item.warehouse_item.product.category:
@@ -321,7 +299,6 @@ async def record_sale_by_barcode(
         sold_qty: int,
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
-        redis: Redis = Depends(get_redis),
 ):
     store_item_query = await db.execute(
         select(StoreItem)
@@ -376,28 +353,9 @@ async def record_sale_by_barcode(
 
     store_item.quantity -= sold_qty
 
-    if store_item.quantity == 0:
-        store_item.status = StoreItemStatus.REMOVED
-
     db.add(new_sale)
     await db.commit()
     await db.refresh(new_sale)
-
-    await redis.delete(f"store:items:{current_user.sid}:*")
-    await redis.delete(f"dashboard:stats:{current_user.sid}")
-    await redis.delete(f"store:reports:{current_user.sid}:*")
-
-    await redis.publish(
-        f"sales:{current_user.sid}",
-        json.dumps({
-            "type": "new_sale",
-            "product_name": store_item.warehouse_item.product.name,
-            "quantity": sold_qty,
-            "price": final_price,
-            "total": sold_qty * final_price,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        })
-    )
 
     category_response = None
     if store_item.warehouse_item.product.category:
@@ -507,7 +465,6 @@ async def create_discount(
         discount: DiscountCreate,
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
-        redis: Redis = Depends(get_redis),
 ):
     store_item_query = await db.execute(
         select(StoreItem)
@@ -551,8 +508,6 @@ async def create_discount(
     await db.commit()
     await db.refresh(new_discount)
 
-    await redis.delete(f"store:items:{current_user.sid}:*")
-
     return new_discount
 
 
@@ -561,7 +516,6 @@ async def mark_as_expired(
         store_item_sid: str,
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
-        redis: Redis = Depends(get_redis),
 ):
     store_item_query = await db.execute(
         select(StoreItem)
@@ -588,8 +542,6 @@ async def mark_as_expired(
     store_item.status = StoreItemStatus.EXPIRED
     await db.commit()
     await db.refresh(store_item)
-
-    await redis.delete(f"store:items:{current_user.sid}:*")
 
     category_response = None
     if store_item.warehouse_item.product.category:
@@ -642,7 +594,6 @@ async def remove_from_store(
         store_item_sid: str,
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
-        redis: Redis = Depends(get_redis),
 ):
     store_item_query = await db.execute(
         select(StoreItem)
@@ -669,8 +620,6 @@ async def remove_from_store(
     store_item.status = StoreItemStatus.REMOVED
     await db.commit()
     await db.refresh(store_item)
-
-    await redis.delete(f"store:items:{current_user.sid}:*")
 
     category_response = None
     if store_item.warehouse_item.product.category:
@@ -724,19 +673,12 @@ async def get_store_reports(
         end_date: datetime = Query(None),
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
-        redis: Redis = Depends(get_redis),
 ):
     if not start_date:
         start_date = datetime.now(timezone.utc) - timedelta(days=30)
 
     if not end_date:
         end_date = datetime.now(timezone.utc)
-
-    cache_key = f"store:reports:{current_user.sid}:{start_date.date()}:{end_date.date()}"
-
-    cached = await redis.get(cache_key)
-    if cached:
-        return json.loads(cached)
 
     sales_query = """
         SELECT 
@@ -834,6 +776,7 @@ async def get_store_reports(
             si.status IN ('EXPIRED', 'REMOVED') AND
             u.user_sid = :user_sid AND
             si.moved_at BETWEEN :start_date AND :end_date
+            AND si.quantity > 0
         GROUP BY 
             p.name, c.name, si.status
         ORDER BY 
@@ -900,11 +843,5 @@ async def get_store_reports(
             )) if discounts_data else 0
         }
     }
-
-    await redis.set(
-        cache_key,
-        json.dumps(report, cls=DateTimeEncoder),
-        ex=1800
-    )
 
     return report

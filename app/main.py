@@ -9,7 +9,7 @@ from prometheus_client import Counter, Histogram, generate_latest
 from prometheus_client.openmetrics.exposition import CONTENT_TYPE_LATEST
 from fastapi.responses import Response
 
-from app.api.v1 import auth, warehouse, store, prediction
+from app.api.v1 import auth, warehouse, store, prediction, dashboard
 from app.core.config import settings
 from app.db.redis import get_redis
 
@@ -101,6 +101,12 @@ app.include_router(
     prediction.router,
     prefix=f"{settings.API_V1_STR}/prediction",
     tags=["prediction"]
+)
+
+app.include_router(
+    dashboard.router,
+    prefix=f"{settings.API_V1_STR}/dashboard",
+    tags=["dashboard"]
 )
 
 
