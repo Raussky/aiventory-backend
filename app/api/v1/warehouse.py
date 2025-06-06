@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, s
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
-from sqlalchemy import or_, and_, func, desc, asc
+from sqlalchemy import or_, and_, func, desc, asc, case
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta, date, timezone
 
@@ -100,7 +100,6 @@ async def upload_file(
                 await db.commit()
                 await db.refresh(product)
 
-            # Check for existing items with same barcode and batch_code
             batch_code = record.get('batch_code')
             if barcode and product.barcode and batch_code:
                 existing_item_query = await db.execute(
@@ -117,7 +116,6 @@ async def upload_file(
                 existing_item = existing_item_query.scalar_one_or_none()
 
                 if existing_item:
-                    # Update quantity instead of creating new item
                     new_quantity = int(record.get('quantity', 0))
                     existing_item.quantity += new_quantity
                     items_updated_count += 1
@@ -135,7 +133,6 @@ async def upload_file(
                     upload.rows_imported += 1
                     continue
 
-            # Create new warehouse item if not updating existing
             expire_date = None
             if record.get('expire_date'):
                 if isinstance(record.get('expire_date'), str):
@@ -150,6 +147,14 @@ async def upload_file(
                 else:
                     received_at = record.get('received_at')
 
+            urgency_level = UrgencyLevel.NORMAL
+            if expire_date:
+                days_until_expiry = (expire_date - date.today()).days
+                if days_until_expiry <= 3:
+                    urgency_level = UrgencyLevel.CRITICAL
+                elif days_until_expiry <= 7:
+                    urgency_level = UrgencyLevel.URGENT
+
             warehouse_item = WarehouseItem(
                 sid=Base.generate_sid(),
                 upload_sid=upload.sid,
@@ -159,7 +164,7 @@ async def upload_file(
                 expire_date=expire_date,
                 received_at=received_at,
                 status=WarehouseItemStatus.IN_STOCK,
-                urgency_level=UrgencyLevel.NORMAL,
+                urgency_level=urgency_level,
             )
             db.add(warehouse_item)
             upload.rows_imported += 1
@@ -197,11 +202,8 @@ async def get_warehouse_items(
         upload_sid: Optional[str] = None,
         expire_soon: bool = False,
         urgency_level: Optional[UrgencyLevel] = None,
-        search: Optional[str] = None,
         category_sid: Optional[str] = None,
         status: Optional[WarehouseItemStatus] = None,
-        sort_by: Optional[str] = Query(None, description="Field to sort by"),
-        sort_order: Optional[str] = Query("asc", regex="^(asc|desc)$"),
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
 ):
@@ -213,7 +215,6 @@ async def get_warehouse_items(
         WarehouseItem.quantity > 0
     )
 
-    # Count total before filtering
     count_query = select(func.count()).select_from(WarehouseItem).join(Upload).where(
         Upload.user_sid == current_user.sid,
         WarehouseItem.quantity > 0
@@ -244,55 +245,26 @@ async def get_warehouse_items(
         query = query.where(WarehouseItem.status == status)
         count_query = count_query.where(WarehouseItem.status == status)
 
-    if search:
-        query = query.join(Product).where(
-            or_(
-                Product.name.ilike(f"%{search}%"),
-                Product.barcode.ilike(f"%{search}%"),
-                WarehouseItem.batch_code.ilike(f"%{search}%")
-            )
-        )
-        count_query = count_query.join(Product).where(
-            or_(
-                Product.name.ilike(f"%{search}%"),
-                Product.barcode.ilike(f"%{search}%"),
-                WarehouseItem.batch_code.ilike(f"%{search}%")
-            )
-        )
-
     if category_sid:
         query = query.join(Product).where(Product.category_sid == category_sid)
         count_query = count_query.join(Product).where(Product.category_sid == category_sid)
 
-    # Get total count
     total_result = await db.execute(count_query)
     total_count = total_result.scalar()
 
-    # Apply sorting
-    if sort_by:
-        if sort_by == "product_name":
-            query = query.join(Product)
-            order_column = Product.name
-        elif sort_by == "quantity":
-            order_column = WarehouseItem.quantity
-        elif sort_by == "expire_date":
-            order_column = WarehouseItem.expire_date
-        elif sort_by == "received_at":
-            order_column = WarehouseItem.received_at
-        elif sort_by == "batch_code":
-            order_column = WarehouseItem.batch_code
-        else:
-            order_column = WarehouseItem.received_at
+    urgency_order = case(
+        (WarehouseItem.urgency_level == UrgencyLevel.CRITICAL, 3),
+        (WarehouseItem.urgency_level == UrgencyLevel.URGENT, 2),
+        (WarehouseItem.urgency_level == UrgencyLevel.NORMAL, 1),
+        else_=0
+    )
 
-        if sort_order == "desc":
-            query = query.order_by(desc(order_column))
-        else:
-            query = query.order_by(asc(order_column))
-    else:
-        query = query.order_by(WarehouseItem.urgency_level.desc(), WarehouseItem.expire_date.asc(),
-                               WarehouseItem.received_at.desc())
+    query = query.order_by(
+        desc(urgency_order),
+        asc(WarehouseItem.expire_date),
+        desc(WarehouseItem.received_at)
+    )
 
-    # Apply pagination
     query = query.offset(skip)
     if limit:
         query = query.limit(limit)
@@ -300,7 +272,19 @@ async def get_warehouse_items(
     result = await db.execute(query)
     items = result.scalars().all()
 
-    # Get categories for filter
+    expiry_threshold = date.today() + timedelta(days=7)
+    for item in items:
+        if item.expire_date:
+            days_until_expiry = (item.expire_date - date.today()).days
+            if days_until_expiry <= 3:
+                item.urgency_level = UrgencyLevel.CRITICAL
+            elif days_until_expiry <= 7:
+                item.urgency_level = UrgencyLevel.URGENT
+            else:
+                item.urgency_level = UrgencyLevel.NORMAL
+        else:
+            item.urgency_level = UrgencyLevel.NORMAL
+
     categories_query = select(Category).join(Product).join(WarehouseItem).join(Upload).where(
         Upload.user_sid == current_user.sid,
         WarehouseItem.quantity > 0
@@ -357,7 +341,6 @@ async def delete_warehouse_items(
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
 ):
-    # Verify all items belong to current user
     items_query = await db.execute(
         select(WarehouseItem)
         .join(Upload)
@@ -416,7 +399,6 @@ async def move_to_store(
         if not product:
             raise HTTPException(status_code=404, detail="Product not found for this barcode")
 
-        # Get most critical items first (by urgency and expiry date)
         warehouse_query = await db.execute(
             select(WarehouseItem)
             .join(Upload)
@@ -427,9 +409,14 @@ async def move_to_store(
                 Upload.user_sid == current_user.sid
             )
             .order_by(
-                WarehouseItem.urgency_level.desc(),
-                WarehouseItem.expire_date.asc(),
-                WarehouseItem.received_at.asc()  # FIFO for same expiry
+                desc(case(
+                    (WarehouseItem.urgency_level == UrgencyLevel.CRITICAL, 3),
+                    (WarehouseItem.urgency_level == UrgencyLevel.URGENT, 2),
+                    (WarehouseItem.urgency_level == UrgencyLevel.NORMAL, 1),
+                    else_=0
+                )),
+                asc(WarehouseItem.expire_date),
+                asc(WarehouseItem.received_at)
             )
         )
         warehouse_item = warehouse_query.scalar_one_or_none()
@@ -546,7 +533,6 @@ async def move_to_store_by_barcode(
     if not product:
         raise HTTPException(status_code=404, detail="Product not found for this barcode")
 
-    # Get most critical items first
     warehouse_query = await db.execute(
         select(WarehouseItem)
         .options(selectinload(WarehouseItem.product).selectinload(Product.category))
@@ -558,9 +544,14 @@ async def move_to_store_by_barcode(
             Upload.user_sid == current_user.sid
         )
         .order_by(
-            WarehouseItem.urgency_level.desc(),
-            WarehouseItem.expire_date.asc(),
-            WarehouseItem.received_at.asc()
+            desc(case(
+                (WarehouseItem.urgency_level == UrgencyLevel.CRITICAL, 3),
+                (WarehouseItem.urgency_level == UrgencyLevel.URGENT, 2),
+                (WarehouseItem.urgency_level == UrgencyLevel.NORMAL, 1),
+                else_=0
+            )),
+            asc(WarehouseItem.expire_date),
+            asc(WarehouseItem.received_at)
         )
     )
     warehouse_item = warehouse_query.scalar_one_or_none()
@@ -618,9 +609,6 @@ async def move_to_store_by_barcode(
 
         if warehouse_item.quantity == 0:
             warehouse_item.status = WarehouseItemStatus.MOVED
-
-        if warehouse_item.urgency_level != UrgencyLevel.NORMAL:
-            warehouse_item.urgency_level = UrgencyLevel.NORMAL
 
         await db.commit()
 
