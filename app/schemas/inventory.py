@@ -51,6 +51,11 @@ class WarehouseItemStatus(str, Enum):
     MOVED = "moved"
     DISCARDED = "discarded"
 
+class UrgencyLevel(str, Enum):
+    NORMAL = "normal"
+    URGENT = "urgent"
+    CRITICAL = "critical"
+
 class WarehouseItemBase(BaseModel):
     product_sid: str
     batch_code: Optional[str] = None
@@ -71,8 +76,10 @@ class WarehouseItemResponse(WarehouseItemBase):
     sid: str
     upload_sid: str
     status: WarehouseItemStatus
+    urgency_level: Optional[UrgencyLevel] = None
     product: ProductResponse
     suggested_price: Optional[float] = None
+    wholesale_price: Optional[float] = None
     discount_suggestion: Optional[Dict[str, Any]] = None
     warehouse_action: Optional[Dict[str, Any]] = None
 
@@ -99,3 +106,5 @@ class WarehouseItemFilter(BaseModel):
     product_sid: Optional[str] = None
     status: Optional[WarehouseItemStatus] = None
     search: Optional[str] = None
+    category_sid: Optional[str] = None
+    urgency_level: Optional[UrgencyLevel] = None
