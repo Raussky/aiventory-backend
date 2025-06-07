@@ -363,8 +363,7 @@ async def delete_warehouse_items(
         .join(Upload)
         .where(
             WarehouseItem.sid.in_(request.item_sids),
-            Upload.user_sid == current_user.sid,
-            WarehouseItem.status == WarehouseItemStatus.IN_STOCK
+            Upload.user_sid == current_user.sid
         )
     )
     items = items_query.scalars().all()
