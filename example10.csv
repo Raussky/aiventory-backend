@@ -1,3 +1,4 @@
 name,category,barcode,quantity,expire_date,received_at,batch_code,unit,price,storage_duration,storage_duration_type
 CLEAN GLASS,Напитки,4607072197063,24,2025-12-01,2025-05-20,REDBULL-001,шт,750,6,month
 Fusetea 1л,Напитки,5449000163462,28,2025-08-20,2025-04-30,fuse-001,л,480,90,day
+Coca-Cola Classic 0.5л,Напитки,5449000000286,50,2025-10-20,2025-05-15,COKE-001,шт,320,180,day

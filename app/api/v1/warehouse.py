@@ -27,6 +27,10 @@ router = APIRouter()
 class DeleteItemsRequest(BaseModel):
     item_sids: List[str]
 
+class PartialDeleteRequest(BaseModel):
+    item_sid: str
+    quantity: int
+
 @router.post("/upload", response_model=Dict[str, Any])
 async def upload_file(
         file: UploadFile = File(...),
@@ -387,6 +391,47 @@ async def delete_warehouse_items(
     return {
         "message": f"Successfully deleted {deleted_count} items",
         "deleted_count": deleted_count
+    }
+
+
+@router.post("/partial-delete", response_model=Dict[str, Any])
+async def partial_delete_warehouse_item(
+        request: PartialDeleteRequest = Body(...),
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+):
+    item_query = await db.execute(
+        select(WarehouseItem)
+        .options(selectinload(WarehouseItem.product))
+        .join(Upload)
+        .where(
+            WarehouseItem.sid == request.item_sid,
+            Upload.user_sid == current_user.sid
+        )
+    )
+    item = item_query.scalar_one_or_none()
+
+    if not item:
+        raise HTTPException(status_code=404, detail="Warehouse item not found")
+
+    if item.quantity < request.quantity:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Not enough quantity available (requested: {request.quantity}, available: {item.quantity})"
+        )
+
+    item.quantity -= request.quantity
+
+    if item.quantity == 0:
+        item.status = WarehouseItemStatus.DISCARDED
+
+    await db.commit()
+    await db.refresh(item)
+
+    return {
+        "message": f"Successfully removed {request.quantity} items from {item.product.name}",
+        "remaining_quantity": item.quantity,
+        "item_status": item.status.value
     }
 
 

@@ -1,10 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text
 from sqlalchemy.orm import selectinload, joinedload
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta, timezone
 import json
+from pydantic import BaseModel
 
 from app.db.session import get_db
 from app.models.users import User
@@ -27,6 +28,10 @@ class DateTimeEncoder(json.JSONEncoder):
         if isinstance(obj, timedelta):
             return str(obj)
         return super().default(obj)
+
+
+class PartialRemoveRequest(BaseModel):
+    quantity: int
 
 
 @router.get("/items", response_model=List[StoreItemResponse])
@@ -618,6 +623,95 @@ async def remove_from_store(
         raise HTTPException(status_code=404, detail="Store item not found")
 
     store_item.status = StoreItemStatus.REMOVED
+    await db.commit()
+    await db.refresh(store_item)
+
+    category_response = None
+    if store_item.warehouse_item.product.category:
+        category_response = CategoryResponse(
+            sid=store_item.warehouse_item.product.category.sid,
+            name=store_item.warehouse_item.product.category.name
+        )
+
+    current_discounts = []
+    for d in store_item.discounts:
+        if d.starts_at <= datetime.now(timezone.utc) <= d.ends_at:
+            current_discounts.append({
+                "sid": d.sid,
+                "store_item_sid": d.store_item_sid,
+                "percentage": d.percentage,
+                "starts_at": d.starts_at,
+                "ends_at": d.ends_at,
+                "created_by_sid": d.created_by_sid,
+            })
+
+    return StoreItemResponse(
+        sid=store_item.sid,
+        warehouse_item_sid=store_item.warehouse_item_sid,
+        quantity=max(0, store_item.quantity),
+        price=store_item.price,
+        moved_at=store_item.moved_at,
+        status=store_item.status,
+        product=ProductResponse(
+            sid=store_item.warehouse_item.product.sid,
+            name=store_item.warehouse_item.product.name,
+            category_sid=store_item.warehouse_item.product.category_sid,
+            barcode=store_item.warehouse_item.product.barcode,
+            default_unit=store_item.warehouse_item.product.default_unit,
+            default_price=store_item.warehouse_item.product.default_price,
+            currency=store_item.warehouse_item.product.currency.value if store_item.warehouse_item.product.currency else None,
+            storage_duration=store_item.warehouse_item.product.storage_duration,
+            storage_duration_type=store_item.warehouse_item.product.storage_duration_type.value if store_item.warehouse_item.product.storage_duration_type else None,
+            category=category_response
+        ),
+        expire_date=store_item.warehouse_item.expire_date,
+        current_discounts=current_discounts,
+        batch_code=store_item.warehouse_item.batch_code,
+        days_until_expiry=(
+                store_item.warehouse_item.expire_date - datetime.now().date()).days if store_item.warehouse_item.expire_date else None
+    )
+
+
+@router.post("/partial-remove/{store_item_sid}", response_model=StoreItemResponse)
+async def partial_remove_from_store(
+        store_item_sid: str,
+        request: PartialRemoveRequest = Body(...),
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+):
+    store_item_query = await db.execute(
+        select(StoreItem)
+        .options(
+            selectinload(StoreItem.warehouse_item)
+            .selectinload(WarehouseItem.product)
+            .selectinload(Product.category),
+            selectinload(StoreItem.warehouse_item)
+            .selectinload(WarehouseItem.upload),
+            selectinload(StoreItem.discounts)
+        )
+        .join(WarehouseItem)
+        .join(Upload)
+        .where(
+            StoreItem.sid == store_item_sid,
+            Upload.user_sid == current_user.sid
+        )
+    )
+    store_item = store_item_query.scalar_one_or_none()
+
+    if not store_item:
+        raise HTTPException(status_code=404, detail="Store item not found")
+
+    if store_item.quantity < request.quantity:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Not enough quantity available (requested: {request.quantity}, available: {store_item.quantity})"
+        )
+
+    store_item.quantity -= request.quantity
+
+    if store_item.quantity == 0:
+        store_item.status = StoreItemStatus.REMOVED
+
     await db.commit()
     await db.refresh(store_item)
 
