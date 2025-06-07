@@ -82,6 +82,7 @@ class WarehouseItemResponse(WarehouseItemBase):
     wholesale_price: Optional[float] = None
     discount_suggestion: Optional[Dict[str, Any]] = None
     warehouse_action: Optional[Dict[str, Any]] = None
+    is_expired: Optional[bool] = False
 
     class Config:
         from_attributes = True
@@ -103,6 +104,7 @@ class UploadResponse(UploadBase):
 class WarehouseItemFilter(BaseModel):
     upload_sid: Optional[str] = None
     expire_soon: Optional[bool] = False
+    expired: Optional[bool] = False
     product_sid: Optional[str] = None
     status: Optional[WarehouseItemStatus] = None
     search: Optional[str] = None

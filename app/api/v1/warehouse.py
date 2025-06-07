@@ -1,10 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status, Query
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status, Query, Body
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
 from sqlalchemy import or_, and_, func, desc, asc, case
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta, date, timezone
+from pydantic import BaseModel
 
 from app.db.session import get_db
 from app.models.users import User
@@ -23,6 +24,8 @@ from app.services.pricing import calculate_store_price, suggest_discount, sugges
 
 router = APIRouter()
 
+class DeleteItemsRequest(BaseModel):
+    item_sids: List[str]
 
 @router.post("/upload", response_model=Dict[str, Any])
 async def upload_file(
@@ -201,6 +204,7 @@ async def get_warehouse_items(
         limit: Optional[int] = None,
         upload_sid: Optional[str] = None,
         expire_soon: bool = False,
+        expired: bool = False,
         urgency_level: Optional[UrgencyLevel] = None,
         category_sid: Optional[str] = None,
         status: Optional[WarehouseItemStatus] = None,
@@ -234,6 +238,16 @@ async def get_warehouse_items(
         count_query = count_query.where(
             WarehouseItem.expire_date <= expiry_threshold,
             WarehouseItem.expire_date >= date.today(),
+            WarehouseItem.status == WarehouseItemStatus.IN_STOCK
+        )
+
+    if expired:
+        query = query.where(
+            WarehouseItem.expire_date < date.today(),
+            WarehouseItem.status == WarehouseItemStatus.IN_STOCK
+        )
+        count_query = count_query.where(
+            WarehouseItem.expire_date < date.today(),
             WarehouseItem.status == WarehouseItemStatus.IN_STOCK
         )
 
@@ -309,6 +323,8 @@ async def get_warehouse_items(
             category=category
         )
 
+        is_expired = item.expire_date and item.expire_date < date.today()
+
         response_item = WarehouseItemResponse(
             sid=item.sid,
             product_sid=item.product_sid,
@@ -322,7 +338,8 @@ async def get_warehouse_items(
             product=item.product,
             suggested_price=suggested_price,
             wholesale_price=base_price,
-            warehouse_action=warehouse_action
+            warehouse_action=warehouse_action,
+            is_expired=is_expired
         )
         response_items.append(response_item)
 
@@ -337,7 +354,7 @@ async def get_warehouse_items(
 
 @router.delete("/items", response_model=Dict[str, Any])
 async def delete_warehouse_items(
-        item_sids: List[str],
+        request: DeleteItemsRequest = Body(...),
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
 ):
@@ -345,17 +362,19 @@ async def delete_warehouse_items(
         select(WarehouseItem)
         .join(Upload)
         .where(
-            WarehouseItem.sid.in_(item_sids),
+            WarehouseItem.sid.in_(request.item_sids),
             Upload.user_sid == current_user.sid,
             WarehouseItem.status == WarehouseItemStatus.IN_STOCK
         )
     )
     items = items_query.scalars().all()
 
-    if len(items) != len(item_sids):
+    if len(items) != len(request.item_sids):
+        found_sids = {item.sid for item in items}
+        missing_sids = set(request.item_sids) - found_sids
         raise HTTPException(
             status_code=400,
-            detail="Some items not found or not available for deletion"
+            detail=f"Some items not found or not available for deletion. Missing SIDs: {list(missing_sids)}"
         )
 
     deleted_count = 0
@@ -452,6 +471,9 @@ async def move_to_store(
 
         if warehouse_item.status != WarehouseItemStatus.IN_STOCK:
             raise HTTPException(status_code=400, detail="Item is not available in stock")
+
+        if warehouse_item.expire_date and warehouse_item.expire_date < date.today():
+            raise HTTPException(status_code=400, detail="Cannot move expired item to store")
 
         if warehouse_item.quantity < quantity:
             raise HTTPException(
@@ -558,6 +580,9 @@ async def move_to_store_by_barcode(
 
     if not warehouse_item:
         raise HTTPException(status_code=404, detail="No available items in warehouse")
+
+    if warehouse_item.expire_date and warehouse_item.expire_date < date.today():
+        raise HTTPException(status_code=400, detail="Cannot move expired item to store")
 
     lock_key = f"lock:item:{warehouse_item.sid}"
     lock_acquired = await redis.set(lock_key, str(current_user.id), nx=True, ex=5)
