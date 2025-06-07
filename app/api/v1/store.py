@@ -707,11 +707,25 @@ async def partial_remove_from_store(
             detail=f"Not enough quantity available (requested: {request.quantity}, available: {store_item.quantity})"
         )
 
+    # Create a new StoreItem record for the removed quantity
+    removed_item = StoreItem(
+        sid=Base.generate_sid(),
+        warehouse_item_sid=store_item.warehouse_item_sid,
+        quantity=request.quantity,
+        price=store_item.price,
+        moved_at=datetime.now(timezone.utc),
+        status=StoreItemStatus.REMOVED
+    )
+
+    # Reduce quantity from the existing item
     store_item.quantity -= request.quantity
 
+    # If all items are removed, mark the original as removed too
     if store_item.quantity == 0:
         store_item.status = StoreItemStatus.REMOVED
 
+    # Add the removed item record to the database
+    db.add(removed_item)
     await db.commit()
     await db.refresh(store_item)
 
