@@ -1,114 +1,140 @@
-from fastapi_mail import FastMail, MessageSchema, ConnectionConfig
 from app.core.config import settings
 from typing import List, Dict, Any
 from loguru import logger
-from celery import shared_task
-import os
+import asyncio
+import aiosmtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 
-def is_smtp_configured():
-    return (
-            settings.SMTP_HOST and
-            settings.SMTP_HOST != "smtp.gmail.com" and
-            settings.SMTP_USER and
-            settings.SMTP_PASSWORD and
-            settings.EMAILS_FROM_EMAIL
-    )
-
-
-def get_mail_config():
-    if not is_smtp_configured():
-        return None
-
-    return ConnectionConfig(
-        MAIL_USERNAME=settings.SMTP_USER,
-        MAIL_PASSWORD=settings.SMTP_PASSWORD,
-        MAIL_FROM=settings.EMAILS_FROM_EMAIL,
-        MAIL_PORT=settings.SMTP_PORT or 587,
-        MAIL_SERVER=settings.SMTP_HOST,
-        MAIL_FROM_NAME=settings.EMAILS_FROM_NAME or "Inventory System",
-        MAIL_STARTTLS=settings.SMTP_TLS if settings.SMTP_TLS is not None else True,
-        MAIL_SSL_TLS=False,
-        USE_CREDENTIALS=True,
-        VALIDATE_CERTS=True
-    )
-
-
-async def send_email(
-        email_to: str,
-        subject: str,
-        body: str,
-        template_name: str = None,
-        template_body: Dict[str, Any] = None
-):
+async def send_email_smtp(email_to: str, subject: str, body: str) -> bool:
     try:
-        conf = get_mail_config()
+        message = MIMEMultipart("alternative")
+        message["Subject"] = subject
+        message["From"] = f"{settings.EMAILS_FROM_NAME} <{settings.EMAILS_FROM_EMAIL}>"
+        message["To"] = email_to
 
-        if not conf:
-            logger.warning(f"SMTP not configured. Email to {email_to} with subject '{subject}' not sent.")
-            logger.info(f"Configure SMTP settings in .env file: SMTP_HOST, SMTP_USER, SMTP_PASSWORD, EMAILS_FROM_EMAIL")
-            return False
+        html_part = MIMEText(body, "html")
+        message.attach(html_part)
 
-        message = MessageSchema(
-            subject=subject,
-            recipients=[email_to],
-            body=body,
-            subtype="html"
+        await aiosmtplib.send(
+            message,
+            hostname=settings.SMTP_HOST,
+            port=settings.SMTP_PORT,
+            username=settings.SMTP_USER,
+            password=settings.SMTP_PASSWORD,
+            start_tls=settings.SMTP_TLS,
         )
 
-        fm = FastMail(conf)
-        await fm.send_message(message)
-        logger.info(f"Email sent successfully to {email_to}, subject: {subject}")
+        logger.info(f"Email sent successfully to {email_to}")
         return True
-
     except Exception as e:
-        logger.error(f"Failed to send email to {email_to}: {str(e)}")
-        if "smtp.example.com" in str(e):
-            logger.error("SMTP server is not configured properly. Please update SMTP_HOST in .env file.")
+        logger.error(f"Failed to send email: {str(e)}")
         return False
 
 
-async def send_verification_email(email_to: str, verification_code: str):
-    if not is_smtp_configured():
-        logger.warning(f"SMTP not configured. Verification code for {email_to}: {verification_code}")
-        logger.info("In development mode, use this code to verify the account.")
-        logger.info("To enable email sending, configure SMTP settings in .env file.")
-        return True
-
-    subject = "Подтверждение регистрации"
+async def send_verification_email(email_to: str, verification_code: str) -> bool:
+    subject = "Подтверждение регистрации - AIventory"
     body = f"""
+    <!DOCTYPE html>
     <html>
-    <body style="font-family: Arial, sans-serif; background-color: #f4f4f4; padding: 20px;">
-        <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 30px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
-            <h1 style="color: #6322FE; text-align: center; margin-bottom: 30px;">Подтверждение регистрации</h1>
-            <p style="color: #333; font-size: 16px; line-height: 1.5;">Спасибо за регистрацию в системе управления запасами!</p>
-            <p style="color: #333; font-size: 16px; line-height: 1.5;">Ваш код подтверждения:</p>
-            <div style="background-color: #f8f9fa; padding: 20px; border-radius: 5px; text-align: center; margin: 20px 0;">
-                <h2 style="color: #6322FE; font-size: 32px; letter-spacing: 5px; margin: 0;">{verification_code}</h2>
-            </div>
-            <p style="color: #666; font-size: 14px; line-height: 1.5;">Этот код действителен в течение 24 часов.</p>
-            <p style="color: #666; font-size: 14px; line-height: 1.5;">Если вы не регистрировались в нашей системе, просто проигнорируйте это письмо.</p>
-            <hr style="margin: 30px 0; border: none; border-top: 1px solid #e0e0e0;">
-            <p style="color: #999; font-size: 12px; text-align: center;">
-                Это автоматическое сообщение. Пожалуйста, не отвечайте на него.
-            </p>
-        </div>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    </head>
+    <body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background-color: #f5f5f5;">
+        <table cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color: #f5f5f5; padding: 20px 0;">
+            <tr>
+                <td align="center">
+                    <table cellpadding="0" cellspacing="0" border="0" width="600" style="max-width: 600px; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+                        <tr>
+                            <td style="padding: 40px 30px; text-align: center; background: linear-gradient(135deg, #6322FE 0%, #8B5CF6 100%); border-radius: 8px 8px 0 0;">
+                                <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 600;">AIventory</h1>
+                                <p style="margin: 10px 0 0 0; color: #E9D5FF; font-size: 16px;">Система управления запасами</p>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 40px 30px;">
+                                <h2 style="margin: 0 0 20px 0; color: #1F2937; font-size: 24px; font-weight: 600; text-align: center;">Подтверждение регистрации</h2>
+                                <p style="margin: 0 0 30px 0; color: #4B5563; font-size: 16px; line-height: 24px; text-align: center;">
+                                    Спасибо за регистрацию! Используйте код ниже для подтверждения вашего email адреса.
+                                </p>
+                                <div style="background-color: #F3F4F6; border-radius: 8px; padding: 30px; text-align: center; margin: 0 0 30px 0;">
+                                    <p style="margin: 0 0 10px 0; color: #6B7280; font-size: 14px; text-transform: uppercase; letter-spacing: 1px;">Ваш код подтверждения</p>
+                                    <div style="font-size: 36px; font-weight: 700; color: #6322FE; letter-spacing: 8px; font-family: 'Courier New', monospace;">
+                                        {verification_code}
+                                    </div>
+                                </div>
+                                <p style="margin: 0 0 20px 0; color: #6B7280; font-size: 14px; line-height: 20px; text-align: center;">
+                                    Этот код действителен в течение 24 часов. Если вы не регистрировались в нашей системе, просто проигнорируйте это письмо.
+                                </p>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 30px; background-color: #F9FAFB; border-radius: 0 0 8px 8px; text-align: center;">
+                                <p style="margin: 0; color: #9CA3AF; font-size: 12px; line-height: 18px;">
+                                    © 2024 AIventory. Все права защищены.<br>
+                                    Это автоматическое сообщение, пожалуйста, не отвечайте на него.
+                                </p>
+                            </td>
+                        </tr>
+                    </table>
+                </td>
+            </tr>
+        </table>
     </body>
     </html>
     """
 
-    return await send_email(email_to=email_to, subject=subject, body=body)
+    return await send_email_smtp(email_to, subject, body)
 
 
-@shared_task
-def send_expiry_notification(user_email: str, warehouse_items: List[Dict], store_items: List[Dict]):
-    if not is_smtp_configured():
-        logger.warning(f"SMTP not configured. Expiry notification for {user_email} not sent.")
-        logger.info(f"Expiring warehouse items: {len(warehouse_items)}")
-        logger.info(f"Expiring store items: {len(store_items)}")
-        return True
+async def send_password_reset_email(email_to: str, reset_code: str) -> bool:
+    subject = "Восстановление пароля - AIventory"
+    body = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    </head>
+    <body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background-color: #f5f5f5;">
+        <table cellpadding="0" cellspacing="0" border="0" width="100%" style="background-color: #f5f5f5; padding: 20px 0;">
+            <tr>
+                <td align="center">
+                    <table cellpadding="0" cellspacing="0" border="0" width="600" style="max-width: 600px; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+                        <tr>
+                            <td style="padding: 40px 30px; text-align: center; background: linear-gradient(135deg, #6322FE 0%, #8B5CF6 100%); border-radius: 8px 8px 0 0;">
+                                <h1 style="margin: 0; color: #ffffff; font-size: 28px; font-weight: 600;">AIventory</h1>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td style="padding: 40px 30px;">
+                                <h2 style="margin: 0 0 20px 0; color: #1F2937; font-size: 24px; font-weight: 600; text-align: center;">Восстановление пароля</h2>
+                                <div style="background-color: #F3F4F6; border-radius: 8px; padding: 30px; text-align: center; margin: 0 0 30px 0;">
+                                    <p style="margin: 0 0 10px 0; color: #6B7280; font-size: 14px;">Код для сброса пароля:</p>
+                                    <div style="font-size: 36px; font-weight: 700; color: #6322FE; letter-spacing: 8px; font-family: 'Courier New', monospace;">
+                                        {reset_code}
+                                    </div>
+                                </div>
+                                <p style="margin: 0; color: #6B7280; font-size: 14px; text-align: center;">
+                                    Код действителен в течение 1 часа.
+                                </p>
+                            </td>
+                        </tr>
+                    </table>
+                </td>
+            </tr>
+        </table>
+    </body>
+    </html>
+    """
 
-    subject = "Товары с истекающим сроком годности"
+    return await send_email_smtp(email_to, subject, body)
+
+
+async def send_expiry_notification(user_email: str, warehouse_items: List[Dict], store_items: List[Dict]) -> bool:
+    subject = "Товары с истекающим сроком годности - AIventory"
 
     warehouse_table = ""
     if warehouse_items:
@@ -180,22 +206,18 @@ def send_expiry_notification(user_email: str, warehouse_items: List[Dict], store
 
             <hr style="margin: 30px 0; border: none; border-top: 1px solid #e0e0e0;">
             <p style="color: #999; font-size: 12px; text-align: center;">
-                Это автоматическое уведомление системы управления запасами.
+                Это автоматическое уведомление системы управления запасами AIventory.
             </p>
         </div>
     </body>
     </html>
     """
 
-    return send_email(email_to=user_email, subject=subject, body=body)
+    return await send_email_smtp(user_email, subject, body)
 
 
-async def send_test_email(email_to: str):
-    if not is_smtp_configured():
-        logger.warning(f"SMTP not configured. Cannot send test email to {email_to}")
-        return False
-
-    subject = "Тестовое сообщение"
+async def send_test_email(email_to: str) -> bool:
+    subject = "Тестовое сообщение - AIventory"
     body = """
     <html>
     <body style="font-family: Arial, sans-serif;">
@@ -205,4 +227,4 @@ async def send_test_email(email_to: str):
     </html>
     """
 
-    return await send_email(email_to=email_to, subject=subject, body=body)
+    return await send_email_smtp(email_to, subject, body)

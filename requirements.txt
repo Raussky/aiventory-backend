@@ -46,6 +46,7 @@ python-dotenv==1.0.0
 
 # Email
 fastapi-mail==1.4.1
+aiosmtplib==2.0.2
 
 # Тесты
 pytest==7.4.2
