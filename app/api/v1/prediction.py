@@ -5,6 +5,7 @@ from sqlalchemy import text
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 import pandas as pd
+import numpy as np
 from sqlalchemy.orm import selectinload
 
 from app.db.session import get_db
@@ -662,3 +663,597 @@ async def get_optimization_suggestions(
             })
 
     return suggestions[:20]
+
+
+@router.get("/turnover-analytics", response_model=Dict[str, Any])
+async def get_turnover_analytics(
+        product_sid: Optional[str] = None,
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+):
+    base_query = """
+        WITH stock_movement AS (
+            SELECT 
+                p.sid as product_sid,
+                p.name as product_name,
+                c.name as category_name,
+                wi.received_at,
+                COALESCE(s.sold_at, CURRENT_DATE) as sold_at,
+                wi.quantity as initial_qty,
+                COALESCE(s.sold_qty, 0) as sold_qty,
+                wi.id as warehouse_item_id
+            FROM 
+                warehouseitem wi
+            JOIN 
+                product p ON wi.product_sid = p.sid
+            JOIN 
+                category c ON p.category_sid = c.sid
+            LEFT JOIN 
+                storeitem si ON wi.sid = si.warehouse_item_sid
+            LEFT JOIN 
+                sale s ON si.sid = s.store_item_sid
+            WHERE 
+                wi.status != 'DISCARDED'
+    """
+
+    params = {}
+    if product_sid:
+        base_query += " AND p.sid = :product_sid"
+        params["product_sid"] = product_sid
+
+    base_query += """
+        ),
+        turnover_metrics AS (
+            SELECT 
+                product_sid,
+                product_name,
+                category_name,
+                AVG(EXTRACT(EPOCH FROM (sold_at - received_at)) / 86400) as avg_days_to_sell,
+                COUNT(DISTINCT warehouse_item_id) as item_count,
+                SUM(sold_qty)::float / NULLIF(SUM(initial_qty), 0) as turnover_rate
+            FROM 
+                stock_movement
+            GROUP BY 
+                product_sid, product_name, category_name
+        ),
+        category_turnover AS (
+            SELECT 
+                category_name,
+                AVG(turnover_rate) as avg_turnover_rate,
+                AVG(avg_days_to_sell) as avg_days
+            FROM 
+                turnover_metrics
+            GROUP BY 
+                category_name
+        ),
+        slow_moving AS (
+            SELECT 
+                p.name,
+                SUM(wi.quantity) as quantity,
+                AVG(wi.wholesale_price * wi.quantity) as value,
+                EXTRACT(EPOCH FROM (CURRENT_DATE - MIN(wi.received_at))) / 86400 as days_in_stock
+            FROM 
+                warehouseitem wi
+            JOIN 
+                product p ON wi.product_sid = p.sid
+            WHERE 
+                wi.status = 'IN_STOCK'
+                AND wi.received_at < CURRENT_DATE - INTERVAL '30 days'
+            GROUP BY 
+                p.name
+            HAVING 
+                SUM(wi.quantity) > 0
+        ),
+        monthly_turnover AS (
+            SELECT 
+                DATE_TRUNC('month', sold_at) as month,
+                SUM(sold_qty)::float / NULLIF(SUM(initial_qty), 0) as turnover_rate
+            FROM 
+                stock_movement
+            WHERE 
+                sold_at >= CURRENT_DATE - INTERVAL '6 months'
+            GROUP BY 
+                DATE_TRUNC('month', sold_at)
+            ORDER BY 
+                month
+        )
+        SELECT 
+            (SELECT AVG(avg_days_to_sell) FROM turnover_metrics) as avg_realization_days,
+            (SELECT json_agg(json_build_object(
+                'category', category_name,
+                'turnoverRate', avg_turnover_rate,
+                'avgDays', ROUND(avg_days)
+            )) FROM category_turnover) as category_turnover,
+            (SELECT json_agg(json_build_object(
+                'name', name,
+                'daysInStock', ROUND(days_in_stock),
+                'quantity', quantity,
+                'value', ROUND(value::numeric, 2)
+            )) FROM slow_moving LIMIT 20) as slow_moving_products,
+            (SELECT json_agg(json_build_object(
+                'month', TO_CHAR(month, 'YYYY-MM'),
+                'turnoverRate', ROUND(turnover_rate::numeric, 3)
+            )) FROM monthly_turnover) as turnover_trend
+    """
+
+    result = await db.execute(text(base_query), params)
+    row = result.fetchone()
+
+    return {
+        "averageRealizationDays": round(row.avg_realization_days or 0),
+        "categoryTurnover": row.category_turnover or [],
+        "slowMovingProducts": row.slow_moving_products or [],
+        "turnoverTrend": row.turnover_trend or []
+    }
+
+
+@router.get("/loss-analytics", response_model=Dict[str, Any])
+async def get_loss_analytics(
+        product_sid: Optional[str] = None,
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+):
+    base_query = """
+        WITH monthly_losses AS (
+            SELECT 
+                DATE_TRUNC('month', si.moved_at) as month,
+                SUM(CASE WHEN si.status = 'EXPIRED' THEN si.quantity * si.price ELSE 0 END) as expired_loss,
+                SUM(CASE WHEN d.percentage > 0 THEN (si.price * d.percentage / 100) * s.sold_qty ELSE 0 END) as discount_loss
+            FROM 
+                storeitem si
+            LEFT JOIN 
+                discount d ON si.sid = d.store_item_sid
+            LEFT JOIN 
+                sale s ON si.sid = s.store_item_sid
+            WHERE 
+                si.moved_at >= CURRENT_DATE - INTERVAL '12 months'
+    """
+
+    params = {}
+    if product_sid:
+        base_query += """
+            AND si.warehouse_item_sid IN (
+                SELECT sid FROM warehouseitem WHERE product_sid = :product_sid
+            )
+        """
+        params["product_sid"] = product_sid
+
+    base_query += """
+            GROUP BY 
+                DATE_TRUNC('month', si.moved_at)
+            ORDER BY 
+                month
+        ),
+        discount_effectiveness AS (
+            SELECT 
+                CASE 
+                    WHEN d.percentage < 10 THEN '0-10%'
+                    WHEN d.percentage < 20 THEN '10-20%'
+                    WHEN d.percentage < 30 THEN '20-30%'
+                    ELSE '30%+'
+                END as discount_range,
+                AVG((s.sold_qty * s.sold_price) / NULLIF((si.quantity * si.price), 0)) * 100 as roi,
+                AVG(s.sold_qty)::float / NULLIF(AVG(si.quantity), 0) * 100 as sales_increase
+            FROM 
+                discount d
+            JOIN 
+                storeitem si ON d.store_item_sid = si.sid
+            JOIN 
+                sale s ON si.sid = s.store_item_sid
+            WHERE 
+                d.starts_at >= CURRENT_DATE - INTERVAL '3 months'
+            GROUP BY 
+                discount_range
+        ),
+        expiry_management AS (
+            SELECT 
+                COUNT(CASE WHEN si.status = 'ACTIVE' AND wi.expire_date > CURRENT_DATE THEN 1 END) as managed_before,
+                COUNT(CASE WHEN si.status = 'EXPIRED' THEN 1 END) as expired,
+                AVG(CASE 
+                    WHEN d.sid IS NOT NULL THEN 
+                        EXTRACT(EPOCH FROM (wi.expire_date - d.starts_at)) / 86400 
+                    ELSE NULL 
+                END) as avg_days_before_action
+            FROM 
+                storeitem si
+            JOIN 
+                warehouseitem wi ON si.warehouse_item_sid = wi.sid
+            LEFT JOIN 
+                discount d ON si.sid = d.store_item_sid
+            WHERE 
+                wi.expire_date IS NOT NULL
+        )
+        SELECT 
+            (SELECT json_agg(json_build_object(
+                'month', TO_CHAR(month, 'YYYY-MM'),
+                'expired', COALESCE(expired_loss, 0),
+                'discounted', COALESCE(discount'discounted', COALESCE(discount_loss, 0),
+                'total', COALESCE(expired_loss + discount_loss, 0)
+            ) ORDER BY month) FROM monthly_losses) as monthly_losses,
+            (SELECT json_agg(json_build_object(
+                'discountRange', discount_range,
+                'roi', ROUND(roi::numeric, 1),
+                'salesIncrease', ROUND(sales_increase::numeric, 1)
+            )) FROM discount_effectiveness) as discount_roi,
+            (SELECT json_build_object(
+                'managedBeforeExpiry', managed_before,
+                'expired', expired,
+                'avgDaysBeforeAction', ROUND(COALESCE(avg_days_before_action, 0))
+            ) FROM expiry_management) as expiry_efficiency,
+            (SELECT json_build_object(
+                'expired', COALESCE(SUM(CASE WHEN si.status = 'EXPIRED' THEN si.quantity * si.price END), 0),
+                'discounts', COALESCE(SUM(CASE WHEN d.percentage > 0 THEN (si.price * d.percentage / 100) * s.sold_qty END), 0),
+                'total', COALESCE(SUM(CASE WHEN si.status = 'EXPIRED' THEN si.quantity * si.price END), 0) + 
+                         COALESCE(SUM(CASE WHEN d.percentage > 0 THEN (si.price * d.percentage / 100) * s.sold_qty END), 0)
+            ) FROM storeitem si
+            LEFT JOIN discount d ON si.sid = d.store_item_sid
+            LEFT JOIN sale s ON si.sid = s.store_item_sid
+            WHERE si.moved_at >= CURRENT_DATE - INTERVAL '30 days') as total_losses
+    """
+
+    result = await db.execute(text(base_query), params)
+    row = result.fetchone()
+
+    return {
+        "monthlyLosses": row[0] or [],
+        "discountROI": row[1] or [],
+        "expiryEfficiency": row[2] or {"managedBeforeExpiry": 0, "expired": 0, "avgDaysBeforeAction": 0},
+        "totalLosses": row[3] or {"expired": 0, "discounts": 0, "total": 0}
+    }
+
+
+@router.get("/abc-xyz-analysis", response_model=Dict[str, Any])
+async def get_abc_xyz_analysis(
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+):
+    query = text("""
+        WITH product_sales AS (
+            SELECT 
+                p.sid as product_sid,
+                p.name as product_name,
+                c.name as category_name,
+                COALESCE(SUM(s.sold_qty * s.sold_price), 0) as revenue,
+                COALESCE(SUM(s.sold_qty), 0) as quantity,
+                COUNT(DISTINCT DATE(s.sold_at)) as sale_days,
+                ARRAY_AGG(s.sold_qty) as daily_quantities
+            FROM 
+                product p
+            JOIN 
+                category c ON p.category_sid = c.sid
+            LEFT JOIN 
+                warehouseitem wi ON p.sid = wi.product_sid
+            LEFT JOIN 
+                storeitem si ON wi.sid = si.warehouse_item_sid
+            LEFT JOIN 
+                sale s ON si.sid = s.store_item_sid
+            WHERE 
+                s.sold_at >= CURRENT_DATE - INTERVAL '90 days'
+                OR s.sold_at IS NULL
+            GROUP BY 
+                p.sid, p.name, c.name
+        ),
+        revenue_ranked AS (
+            SELECT 
+                *,
+                SUM(revenue) OVER () as total_revenue,
+                revenue::float / NULLIF(SUM(revenue) OVER (), 0) * 100 as revenue_share,
+                SUM(revenue) OVER (ORDER BY revenue DESC) as cumulative_revenue
+            FROM 
+                product_sales
+        ),
+        abc_classified AS (
+            SELECT 
+                *,
+                CASE 
+                    WHEN cumulative_revenue <= total_revenue * 0.8 THEN 'A'
+                    WHEN cumulative_revenue <= total_revenue * 0.95 THEN 'B'
+                    ELSE 'C'
+                END as abc_class
+            FROM 
+                revenue_ranked
+        ),
+        xyz_classified AS (
+            SELECT 
+                *,
+                CASE 
+                    WHEN sale_days = 0 THEN 100
+                    ELSE (
+                        SELECT STDDEV(q)::float / NULLIF(AVG(q), 0) * 100 
+                        FROM UNNEST(daily_quantities) q
+                    )
+                END as demand_variability,
+                CASE 
+                    WHEN sale_days = 0 THEN 'Z'
+                    WHEN (
+                        SELECT STDDEV(q)::float / NULLIF(AVG(q), 0) 
+                        FROM UNNEST(daily_quantities) q
+                    ) < 0.2 THEN 'X'
+                    WHEN (
+                        SELECT STDDEV(q)::float / NULLIF(AVG(q), 0) 
+                        FROM UNNEST(daily_quantities) q
+                    ) < 0.5 THEN 'Y'
+                    ELSE 'Z'
+                END as xyz_class
+            FROM 
+                abc_classified
+        )
+        SELECT 
+            json_agg(json_build_object(
+                'productSid', product_sid,
+                'productName', product_name,
+                'category', category_name,
+                'abcClass', abc_class,
+                'xyzClass', xyz_class,
+                'revenue', ROUND(revenue::numeric, 2),
+                'revenueShare', ROUND(revenue_share::numeric, 2),
+                'demandVariability', ROUND(demand_variability::numeric, 2),
+                'quantity', quantity
+            ) ORDER BY revenue DESC) as matrix,
+            json_build_object(
+                'A', json_build_object(
+                    'count', COUNT(CASE WHEN abc_class = 'A' THEN 1 END),
+                    'revenueShare', ROUND(SUM(CASE WHEN abc_class = 'A' THEN revenue_share ELSE 0 END)::numeric, 1)
+                ),
+                'B', json_build_object(
+                    'count', COUNT(CASE WHEN abc_class = 'B' THEN 1 END),
+                    'revenueShare', ROUND(SUM(CASE WHEN abc_class = 'B' THEN revenue_share ELSE 0 END)::numeric, 1)
+                ),
+                'C', json_build_object(
+                    'count', COUNT(CASE WHEN abc_class = 'C' THEN 1 END),
+                    'revenueShare', ROUND(SUM(CASE WHEN abc_class = 'C' THEN revenue_share ELSE 0 END)::numeric, 1)
+                ),
+                'X', json_build_object('count', COUNT(CASE WHEN xyz_class = 'X' THEN 1 END)),
+                'Y', json_build_object('count', COUNT(CASE WHEN xyz_class = 'Y' THEN 1 END)),
+                'Z', json_build_object('count', COUNT(CASE WHEN xyz_class = 'Z' THEN 1 END))
+            ) as summary
+        FROM 
+            xyz_classified
+    """)
+
+    result = await db.execute(query)
+    row = result.fetchone()
+
+    return {
+        "matrix": row[0] or [],
+        "summary": row[1] or {
+            "A": {"count": 0, "revenueShare": 0},
+            "B": {"count": 0, "revenueShare": 0},
+            "C": {"count": 0, "revenueShare": 0},
+            "X": {"count": 0},
+            "Y": {"count": 0},
+            "Z": {"count": 0}
+        }
+    }
+
+
+@router.get("/financial-metrics", response_model=Dict[str, Any])
+async def get_financial_metrics(
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+):
+    query = text("""
+        WITH category_margins AS (
+            SELECT 
+                c.name as category_name,
+                SUM(s.sold_qty * s.sold_price) as revenue,
+                SUM(s.sold_qty * (s.sold_price - COALESCE(wi.wholesale_price, p.default_price * 0.6))) as gross_profit,
+                AVG((s.sold_price - COALESCE(wi.wholesale_price, p.default_price * 0.6)) / NULLIF(s.sold_price, 0) * 100) as margin
+            FROM 
+                sale s
+            JOIN 
+                storeitem si ON s.store_item_sid = si.sid
+            JOIN 
+                warehouseitem wi ON si.warehouse_item_sid = wi.sid
+            JOIN 
+                product p ON wi.product_sid = p.sid
+            JOIN 
+                category c ON p.category_sid = c.sid
+            WHERE 
+                s.sold_at >= CURRENT_DATE - INTERVAL '30 days'
+            GROUP BY 
+                c.name
+        ),
+        monthly_avg_check AS (
+            SELECT 
+                DATE_TRUNC('month', s.sold_at) as month,
+                SUM(s.sold_qty * s.sold_price) / COUNT(DISTINCT s.cashier_sid) as avg_check,
+                COUNT(DISTINCT s.sid) as transaction_count
+            FROM 
+                sale s
+            WHERE 
+                s.sold_at >= CURRENT_DATE - INTERVAL '6 months'
+            GROUP BY 
+                DATE_TRUNC('month', s.sold_at)
+            ORDER BY 
+                month
+        ),
+        product_ltv AS (
+            SELECT 
+                p.name as product_name,
+                COUNT(DISTINCT s.cashier_sid) as unique_customers,
+                SUM(s.sold_qty * s.sold_price) as total_revenue,
+                COUNT(DISTINCT DATE_TRUNC('month', s.sold_at)) as active_months,
+                AVG(s.sold_qty * s.sold_price) as avg_order_value,
+                COUNT(s.sid)::float / COUNT(DISTINCT s.cashier_sid) as avg_purchase_frequency
+            FROM 
+                sale s
+            JOIN 
+                storeitem si ON s.store_item_sid = si.sid
+            JOIN 
+                warehouseitem wi ON si.warehouse_item_sid = wi.sid
+            JOIN 
+                product p ON wi.product_sid = p.sid
+            WHERE 
+                s.sold_at >= CURRENT_DATE - INTERVAL '90 days'
+            GROUP BY 
+                p.name
+            HAVING 
+                COUNT(DISTINCT s.cashier_sid) >= 3
+        ),
+        profitability AS (
+            SELECT 
+                SUM(s.sold_qty * s.sold_price) as total_revenue,
+                SUM(s.sold_qty * (s.sold_price - COALESCE(wi.wholesale_price, p.default_price * 0.6))) as gross_profit,
+                SUM(CASE WHEN si.status = 'EXPIRED' THEN si.quantity * wi.wholesale_price ELSE 0 END) as losses
+            FROM 
+                sale s
+            JOIN 
+                storeitem si ON s.store_item_sid = si.sid
+            JOIN 
+                warehouseitem wi ON si.warehouse_item_sid = wi.sid
+            JOIN 
+                product p ON wi.product_sid = p.sid
+            WHERE 
+                s.sold_at >= CURRENT_DATE - INTERVAL '30 days'
+        )
+        SELECT 
+            (SELECT json_agg(json_build_object(
+                'category', category_name,
+                'margin', ROUND(margin::numeric, 1),
+                'revenue', ROUND(revenue::numeric, 2)
+            ) ORDER BY revenue DESC) FROM category_margins) as margin_by_category,
+            (SELECT json_agg(json_build_object(
+                'month', TO_CHAR(month, 'YYYY-MM'),
+                'avgCheck', ROUND(avg_check::numeric, 2),
+                'transactionCount', transaction_count
+            ) ORDER BY month) FROM monthly_avg_check) as avg_check_trend,
+            (SELECT json_agg(json_build_object(
+                'productName', product_name,
+                'ltv', ROUND((total_revenue / unique_customers)::numeric, 2),
+                'avgPurchaseFrequency', ROUND(avg_purchase_frequency::numeric, 2),
+                'avgOrderValue', ROUND(avg_order_value::numeric, 2)
+            ) ORDER BY total_revenue / unique_customers DESC LIMIT 20) FROM product_ltv) as product_ltv,
+            (SELECT json_build_object(
+                'grossProfit', ROUND(gross_profit::numeric, 2),
+                'netProfit', ROUND((gross_profit - losses)::numeric, 2),
+                'grossMargin', ROUND((gross_profit / NULLIF(total_revenue, 0) * 100)::numeric, 1),
+                'netMargin', ROUND(((gross_profit - losses) / NULLIF(total_revenue, 0) * 100)::numeric, 1),
+                'lossesImpact', ROUND((losses / NULLIF(gross_profit, 0) * 100)::numeric, 1)
+            ) FROM profitability) as profitability
+    """)
+
+    result = await db.execute(query)
+    row = result.fetchone()
+
+    return {
+        "marginByCategory": row[0] or [],
+        "avgCheckTrend": row[1] or [],
+        "productLTV": row[2] or [],
+        "profitability": row[3] or {
+            "grossProfit": 0,
+            "netProfit": 0,
+            "grossMargin": 0,
+            "netMargin": 0,
+            "lossesImpact": 0
+        }
+    }
+
+
+@router.get("/optimal-purchase/{product_sid}", response_model=Dict[str, Any])
+async def get_optimal_purchase(
+        product_sid: str,
+        lead_time_days: int = Query(7, ge=1, le=30),
+        service_level: float = Query(0.95, ge=0.8, le=0.99),
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+):
+    prediction_service = PredictionService(db)
+
+    query = text("""
+        WITH sales_stats AS (
+            SELECT 
+                AVG(s.sold_qty) as avg_daily_demand,
+                STDDEV(s.sold_qty) as demand_std,
+                COUNT(DISTINCT DATE(s.sold_at)) as sale_days
+            FROM 
+                sale s
+            JOIN 
+                storeitem si ON s.store_item_sid = si.sid
+            JOIN 
+                warehouseitem wi ON si.warehouse_item_sid = wi.sid
+            WHERE 
+                wi.product_sid = :product_sid
+                AND s.sold_at >= CURRENT_DATE - INTERVAL '30 days'
+        ),
+        current_inventory AS (
+            SELECT 
+                COALESCE(SUM(wi.quantity), 0) + COALESCE(SUM(si.quantity), 0) as total_stock,
+                COALESCE(AVG(wi.wholesale_price), p.default_price * 0.6) as unit_cost
+            FROM 
+                product p
+            LEFT JOIN 
+                warehouseitem wi ON p.sid = wi.product_sid AND wi.status = 'IN_STOCK'
+            LEFT JOIN 
+                storeitem si ON wi.sid = si.warehouse_item_sid AND si.status = 'ACTIVE'
+            WHERE 
+                p.sid = :product_sid
+            GROUP BY 
+                p.default_price
+        )
+        SELECT 
+            ss.avg_daily_demand,
+            ss.demand_std,
+            ss.sale_days,
+            ci.total_stock,
+            ci.unit_cost
+        FROM 
+            sales_stats ss, current_inventory ci
+    """)
+
+    result = await db.execute(query, {"product_sid": product_sid})
+    row = result.fetchone()
+
+    if not row or row.sale_days < 7:
+        raise HTTPException(
+            status_code=400,
+            detail="Not enough sales data for optimal purchase calculation"
+        )
+
+    avg_daily_demand = float(row.avg_daily_demand)
+    demand_std = float(row.demand_std) if row.demand_std else avg_daily_demand * 0.2
+    current_stock = float(row.total_stock)
+    unit_cost = float(row.unit_cost)
+
+    from scipy.stats import norm
+    z_score = norm.ppf(service_level)
+
+    safety_stock = z_score * demand_std * np.sqrt(lead_time_days)
+    reorder_point = avg_daily_demand * lead_time_days + safety_stock
+
+    holding_cost_rate = 0.2
+    ordering_cost = 100
+
+    eoq = np.sqrt((2 * ordering_cost * avg_daily_demand * 365) / (unit_cost * holding_cost_rate))
+
+    days_until_reorder = max(0, (current_stock - reorder_point) / avg_daily_demand)
+    next_order_date = datetime.now() + timedelta(days=int(days_until_reorder))
+
+    stockout_risk = current_stock < reorder_point
+
+    projection_days = 30
+    stock_projection = []
+    for day in range(projection_days):
+        date = datetime.now() + timedelta(days=day)
+        projected_stock = max(0, current_stock - avg_daily_demand * day)
+
+        if day == int(days_until_reorder) and projected_stock < reorder_point:
+            projected_stock += eoq
+
+        stock_projection.append({
+            "date": date.strftime("%Y-%m-%d"),
+            "stock": round(projected_stock),
+            "reorderPoint": round(reorder_point)
+        })
+
+    return {
+        "reorderPoint": round(reorder_point),
+        "safetyStock": round(safety_stock),
+        "economicOrderQuantity": round(eoq),
+        "leadTimeDays": lead_time_days,
+        "currentStock": round(current_stock),
+        "averageDailyDemand": round(avg_daily_demand, 2),
+        "stockoutRisk": stockout_risk,
+        "nextOrderDate": next_order_date.strftime("%Y-%m-%d"),
+        "stockProjection": stock_projection
+    }

@@ -6,12 +6,13 @@ import logging
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from prophet import Prophet
-from prophet.diagnostics import cross_validation, performance_metrics
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
-from statsmodels.tsa.seasonal import seasonal_decompose
 import warnings
+import pickle
+import os
+from pathlib import Path
 
 warnings.filterwarnings('ignore')
 
@@ -22,9 +23,12 @@ logger = logging.getLogger(__name__)
 
 
 class PredictionService:
-    def __init__(self, db: AsyncSession):
+    def __init__(self, db: AsyncSession, user_sid: str):
         self.db = db
-        self.model_version = "ensemble_v2.0.0"
+        self.user_sid = user_sid
+        self.model_version = "user_specific_v3.0.0"
+        self.models_dir = Path("ml_models") / user_sid
+        self.models_dir.mkdir(parents=True, exist_ok=True)
 
     async def get_sales_data(self, product_sid: str, days_back: int = 180) -> pd.DataFrame:
         query = text("""
@@ -48,12 +52,15 @@ class PredictionService:
             JOIN 
                 warehouseitem wi ON si.warehouse_item_sid = wi.sid
             JOIN 
+                upload u ON wi.upload_sid = u.sid
+            JOIN 
                 product p ON wi.product_sid = p.sid
             JOIN
                 category c ON p.category_sid = c.sid
             WHERE 
                 p.sid = :product_sid
                 AND s.sold_at >= :min_date
+                AND u.user_sid = :user_sid
             GROUP BY 
                 DATE(s.sold_at), p.name, c.name, EXTRACT(DOW FROM s.sold_at), EXTRACT(MONTH FROM s.sold_at)
             ORDER BY 
@@ -65,55 +72,13 @@ class PredictionService:
         try:
             result = await self.db.execute(
                 query,
-                {"product_sid": product_sid, "min_date": min_date}
+                {"product_sid": product_sid, "min_date": min_date, "user_sid": self.user_sid}
             )
             rows = result.fetchall()
 
             if not rows:
-                logger.warning(f"No sales data found for product {product_sid}")
-                prod_query = text("""
-                    SELECT p.name as product_name, c.name as category_name
-                    FROM product p
-                    JOIN category c ON p.category_sid = c.sid
-                    WHERE p.sid = :product_sid
-                """)
-                prod_result = await self.db.execute(prod_query, {"product_sid": product_sid})
-                prod_row = prod_result.fetchone()
-
-                if prod_row:
-                    product_name = prod_row.product_name
-                    category_name = prod_row.category_name
-                else:
-                    product_name = "Unknown"
-                    category_name = "Unknown"
-
-                df = pd.DataFrame(columns=["ds", "y", "product_name", "category_name", "avg_price",
-                                           "unique_customers", "day_of_week", "month", "is_weekend"])
-
-                date_range = pd.date_range(
-                    start=min_date,
-                    end=datetime.now().date(),
-                    freq='D'
-                )
-
-                empty_data = []
-                for single_date in date_range:
-                    empty_data.append({
-                        "ds": single_date,
-                        "y": 0.0,
-                        "product_name": product_name,
-                        "category_name": category_name,
-                        "avg_price": 0.0,
-                        "unique_customers": 0,
-                        "day_of_week": single_date.dayofweek,
-                        "month": single_date.month,
-                        "is_weekend": 1 if single_date.dayofweek in [5, 6] else 0
-                    })
-
-                if empty_data:
-                    df = pd.DataFrame(empty_data)
-
-                return df
+                logger.warning(f"No sales data found for product {product_sid} and user {self.user_sid}")
+                return pd.DataFrame()
 
             df = pd.DataFrame([
                 {
@@ -141,7 +106,6 @@ class PredictionService:
             )
 
             date_df = pd.DataFrame({"ds": date_range})
-
             merged_df = pd.merge(date_df, df, on='ds', how='left')
 
             merged_df['y'] = merged_df['y'].fillna(0)
@@ -157,6 +121,8 @@ class PredictionService:
             merged_df['lag_7'] = merged_df['y'].shift(7).fillna(0)
             merged_df['rolling_mean_7'] = merged_df['y'].rolling(window=7, min_periods=1).mean()
             merged_df['rolling_std_7'] = merged_df['y'].rolling(window=7, min_periods=1).std().fillna(0)
+            merged_df['rolling_mean_30'] = merged_df['y'].rolling(window=30, min_periods=1).mean()
+            merged_df['ema_7'] = merged_df['y'].ewm(span=7, adjust=False).mean()
 
             return merged_df
 
@@ -164,124 +130,49 @@ class PredictionService:
             logger.error(f"Error getting sales data: {str(e)}")
             raise
 
-    async def get_category_seasonality(self, category_sid: str) -> Dict[str, Any]:
-        query = text("""
-            SELECT 
-                EXTRACT(DOW FROM s.sold_at) as day_of_week,
-                EXTRACT(MONTH FROM s.sold_at) as month,
-                AVG(s.sold_qty) as avg_quantity,
-                STDDEV(s.sold_qty) as std_quantity
-            FROM 
-                sale s
-            JOIN 
-                storeitem si ON s.store_item_sid = si.sid
-            JOIN 
-                warehouseitem wi ON si.warehouse_item_sid = wi.sid
-            JOIN 
-                product p ON wi.product_sid = p.sid
-            WHERE 
-                p.category_sid = :category_sid
-                AND s.sold_at >= :min_date
-            GROUP BY 
-                day_of_week, month
-            ORDER BY 
-                month, day_of_week
-        """)
+    def _save_model(self, model: Any, product_sid: str, model_type: str):
+        model_path = self.models_dir / f"{product_sid}_{model_type}.pkl"
+        with open(model_path, 'wb') as f:
+            pickle.dump(model, f)
 
-        min_date = datetime.now() - timedelta(days=365)
+    def _load_model(self, product_sid: str, model_type: str) -> Optional[Any]:
+        model_path = self.models_dir / f"{product_sid}_{model_type}.pkl"
+        if model_path.exists():
+            try:
+                with open(model_path, 'rb') as f:
+                    return pickle.load(f)
+            except Exception as e:
+                logger.error(f"Error loading model: {str(e)}")
+                return None
+        return None
 
-        try:
-            result = await self.db.execute(query, {"category_sid": category_sid, "min_date": min_date})
-            rows = result.fetchall()
+    async def train_prophet_model(self, product_sid: str) -> Optional[Prophet]:
+        cached_model = self._load_model(product_sid, "prophet")
+        if cached_model:
+            return cached_model
 
-            if not rows:
-                return {
-                    "day_of_week": {},
-                    "monthly": {},
-                    "has_seasonality": False,
-                    "seasonality_strength": 0
-                }
-
-            df = pd.DataFrame([
-                {
-                    "day_of_week": float(row.day_of_week),
-                    "month": float(row.month),
-                    "avg_quantity": float(row.avg_quantity),
-                    "std_quantity": float(row.std_quantity) if row.std_quantity else 0
-                } for row in rows
-            ])
-
-            daily_seasonality = df.groupby('day_of_week')['avg_quantity'].mean().to_dict()
-            monthly_seasonality = df.groupby('month')['avg_quantity'].mean().to_dict()
-
-            daily_values = list(daily_seasonality.values())
-            monthly_values = list(monthly_seasonality.values())
-
-            if daily_values and monthly_values:
-                daily_variation = np.std(daily_values) / np.mean(daily_values)
-                monthly_variation = np.std(monthly_values) / np.mean(monthly_values)
-                seasonality_strength = max(daily_variation, monthly_variation)
-            else:
-                daily_variation = 0
-                monthly_variation = 0
-                seasonality_strength = 0
-
-            has_seasonality = bool(daily_variation > 0.2 or monthly_variation > 0.3)
-
-            return {
-                "day_of_week": {int(k): float(v) for k, v in daily_seasonality.items()},
-                "monthly": {int(k): float(v) for k, v in monthly_seasonality.items()},
-                "has_seasonality": has_seasonality,
-                "seasonality_strength": float(seasonality_strength)
-            }
-
-        except Exception as e:
-            logger.error(f"Error getting category seasonality: {str(e)}")
-            return {
-                "day_of_week": {},
-                "monthly": {},
-                "has_seasonality": False,
-                "seasonality_strength": 0
-            }
-
-    async def train_prophet_model(self,
-                                  product_sid: str,
-                                  seasonality_info: Dict[str, Any] = None) -> Optional[Prophet]:
         df = await self.get_sales_data(product_sid)
 
-        if df.empty or len(df) < 7:
+        if df.empty or len(df) < 14:
             logger.warning(f"Not enough data to train model for product {product_sid}")
             return None
 
         try:
-            if not seasonality_info:
-                prod_query = text("""
-                    SELECT p.category_sid
-                    FROM product p
-                    WHERE p.sid = :product_sid
-                """)
-                prod_result = await self.db.execute(prod_query, {"product_sid": product_sid})
-                category_sid = prod_result.scalar_one_or_none()
-
-                if category_sid:
-                    seasonality_info = await self.get_category_seasonality(category_sid)
-
             model = Prophet(
                 yearly_seasonality=True,
                 weekly_seasonality=True,
                 daily_seasonality=False,
                 seasonality_mode='multiplicative',
-                changepoint_prior_scale=0.05,
-                interval_width=0.95
+                changepoint_prior_scale=0.1,
+                interval_width=0.95,
+                growth='linear'
             )
 
-            has_seasonality = bool(seasonality_info.get('has_seasonality', False)) if seasonality_info else False
-            if has_seasonality:
-                model.add_seasonality(
-                    name='monthly',
-                    period=30.5,
-                    fourier_order=5
-                )
+            model.add_seasonality(
+                name='monthly',
+                period=30.5,
+                fourier_order=5
+            )
 
             model.add_regressor('is_weekend')
             model.add_regressor('lag_7')
@@ -289,7 +180,12 @@ class PredictionService:
 
             train_df = df[['ds', 'y', 'is_weekend', 'lag_7', 'rolling_mean_7']].copy()
 
-            model.fit(train_df)
+            train_split = int(len(train_df) * 0.8)
+            train_data = train_df[:train_split]
+
+            model.fit(train_data)
+
+            self._save_model(model, product_sid, "prophet")
 
             return model
 
@@ -298,36 +194,48 @@ class PredictionService:
             return None
 
     async def train_ensemble_models(self, product_sid: str) -> Dict[str, Any]:
+        cached_models = self._load_model(product_sid, "ensemble")
+        if cached_models:
+            return cached_models
+
         df = await self.get_sales_data(product_sid, days_back=365)
 
-        if df.empty or len(df) < 30:
+        if df.empty or len(df) < 60:
             return None
 
         features = ['day_of_week', 'month', 'is_weekend', 'lag_1', 'lag_7',
-                    'rolling_mean_7', 'rolling_std_7']
+                    'rolling_mean_7', 'rolling_std_7', 'rolling_mean_30', 'ema_7']
 
         X = df[features].fillna(0)
         y = df['y']
-
-        if len(X) < 30:
-            return None
 
         train_size = int(0.8 * len(X))
         X_train, X_test = X[:train_size], X[train_size:]
         y_train, y_test = y[:train_size], y[train_size:]
 
-        rf_model = RandomForestRegressor(n_estimators=100, random_state=42)
+        rf_model = RandomForestRegressor(
+            n_estimators=200,
+            max_depth=10,
+            min_samples_split=5,
+            min_samples_leaf=2,
+            random_state=42
+        )
         rf_model.fit(X_train, y_train)
 
         lr_model = LinearRegression()
         lr_model.fit(X_train, y_train)
 
-        return {
+        models_data = {
             'random_forest': rf_model,
             'linear_regression': lr_model,
             'features': features,
-            'last_data': df.iloc[-1].to_dict()
+            'last_data': df.iloc[-1].to_dict(),
+            'training_date': datetime.now()
         }
+
+        self._save_model(models_data, product_sid, "ensemble")
+
+        return models_data
 
     async def generate_forecast(
             self,
@@ -422,27 +330,31 @@ class PredictionService:
                             'lag_1': ensemble_models['last_data']['y'],
                             'lag_7': ensemble_models['last_data']['y'],
                             'rolling_mean_7': ensemble_models['last_data']['rolling_mean_7'],
-                            'rolling_std_7': ensemble_models['last_data']['rolling_std_7']
+                            'rolling_std_7': ensemble_models['last_data']['rolling_std_7'],
+                            'rolling_mean_30': ensemble_models['last_data'].get('rolling_mean_30',
+                                                                                ensemble_models['last_data'][
+                                                                                    'rolling_mean_7']),
+                            'ema_7': ensemble_models['last_data'].get('ema_7', ensemble_models['last_data']['y'])
                         }
                         future_features.append(features)
 
                     X_future = pd.DataFrame(future_features)
                     rf_pred = ensemble_models['random_forest'].predict(X_future).sum()
                     lr_pred = ensemble_models['linear_regression'].predict(X_future).sum()
-                    ensemble_qty = (rf_pred + lr_pred) / 2
+                    ensemble_qty = (rf_pred * 0.7 + lr_pred * 0.3)
 
                 if prophet_model and ensemble_models:
-                    forecast_qty = (prophet_qty * 0.7 + ensemble_qty * 0.3)
-                    forecast_qty_lower = prophet_lower * 0.8
-                    forecast_qty_upper = prophet_upper * 1.2
+                    forecast_qty = (prophet_qty * 0.6 + ensemble_qty * 0.4)
+                    forecast_qty_lower = prophet_lower * 0.9
+                    forecast_qty_upper = prophet_upper * 1.1
                 elif prophet_model:
                     forecast_qty = prophet_qty
                     forecast_qty_lower = prophet_lower
                     forecast_qty_upper = prophet_upper
                 else:
                     forecast_qty = ensemble_qty
-                    forecast_qty_lower = ensemble_qty * 0.7
-                    forecast_qty_upper = ensemble_qty * 1.3
+                    forecast_qty_lower = ensemble_qty * 0.8
+                    forecast_qty_upper = ensemble_qty * 1.2
 
                 results.append({
                     "product_sid": product_sid,
@@ -455,7 +367,8 @@ class PredictionService:
                     "forecast_qty_lower": max(0, round(float(forecast_qty_lower), 2)),
                     "forecast_qty_upper": max(0, round(float(forecast_qty_upper), 2)),
                     "generated_at": datetime.now(),
-                    "model_version": f"{self.model_version}"
+                    "model_version": self.model_version,
+                    "user_sid": self.user_sid
                 })
 
             return results
@@ -478,138 +391,146 @@ class PredictionService:
             df = await self.get_sales_data(product_sid)
 
             if df.empty:
-                if not product_name or not category_name:
-                    prod_query = text("""
-                        SELECT p.name, c.name as category_name
-                        FROM product p
-                        JOIN category c ON p.category_sid = c.sid
-                        WHERE p.sid = :product_sid
-                    """)
-                    prod_result = await self.db.execute(prod_query, {"product_sid": product_sid})
-                    prod_row = prod_result.fetchone()
-
-                    if prod_row:
-                        product_name = prod_row.name
-                        category_name = prod_row.category_name
-                    else:
-                        product_name = "Unknown"
-                        category_name = "Unknown"
-
-                return self._generate_placeholder_forecast(
-                    product_sid, timeframe, periods_ahead, product_name, category_name
-                )
+                logger.warning(f"No sales data for statistical forecast for product {product_sid}")
+                return []
 
             if not product_name:
                 product_name = df['product_name'].iloc[0]
             if not category_name:
                 category_name = df['category_name'].iloc[0]
 
-            if len(df) >= 14:
-                y_values = df['y'].values
+            y_values = df['y'].values
+            recent_avg = np.mean(y_values[-30:])
+            recent_std = np.std(y_values[-30:])
 
-                if len(y_values) >= 30:
-                    window_size = 14
-                else:
-                    window_size = max(3, len(y_values) // 3)
+            trend = 0
+            if len(y_values) >= 60:
+                recent_period = y_values[-30:]
+                previous_period = y_values[-60:-30]
+                trend = (np.mean(recent_period) - np.mean(previous_period)) / 30
 
-                recent_avg = np.mean(y_values[-window_size:])
+            today = datetime.now().date()
+            days_per_period = 1 if timeframe == TimeFrame.DAY else 7 if timeframe == TimeFrame.WEEK else 30
 
-                if len(y_values) >= window_size * 2:
-                    prev_avg = np.mean(y_values[-(window_size * 2):-window_size])
-                    trend = (recent_avg - prev_avg) / window_size
-                else:
-                    trend = 0
+            results = []
+            for i in range(periods_ahead):
+                period_start = today + timedelta(days=i * days_per_period)
+                period_end = period_start + timedelta(days=days_per_period - 1)
 
-                today = datetime.now().date()
-                days_per_period = 1 if timeframe == TimeFrame.DAY else 7 if timeframe == TimeFrame.WEEK else 30
+                forecast_qty = (recent_avg + trend * (i + 1)) * days_per_period
+                forecast_qty = max(0, forecast_qty)
 
-                results = []
-                for i in range(periods_ahead):
-                    period_start = today + timedelta(days=i * days_per_period)
-                    period_end = period_start + timedelta(days=days_per_period - 1)
+                confidence_interval = 1.96 * recent_std * np.sqrt(days_per_period)
+                forecast_qty_lower = max(0, forecast_qty - confidence_interval)
+                forecast_qty_upper = forecast_qty + confidence_interval
 
-                    forecast_qty = recent_avg + trend * (i + 1) * days_per_period
-                    forecast_qty = max(0, forecast_qty * days_per_period)
+                results.append({
+                    "product_sid": product_sid,
+                    "product_name": product_name,
+                    "category_name": category_name,
+                    "timeframe": timeframe,
+                    "period_start": period_start,
+                    "period_end": period_end,
+                    "forecast_qty": round(float(forecast_qty), 2),
+                    "forecast_qty_lower": round(float(forecast_qty_lower), 2),
+                    "forecast_qty_upper": round(float(forecast_qty_upper), 2),
+                    "generated_at": datetime.now(),
+                    "model_version": f"{self.model_version} (statistical)",
+                    "user_sid": self.user_sid
+                })
 
-                    std_dev = np.std(y_values[-min(30, len(y_values)):])
-                    forecast_qty_lower = max(0, forecast_qty - 1.96 * std_dev * days_per_period)
-                    forecast_qty_upper = forecast_qty + 1.96 * std_dev * days_per_period
-
-                    results.append({
-                        "product_sid": product_sid,
-                        "product_name": product_name,
-                        "category_name": category_name,
-                        "timeframe": timeframe,
-                        "period_start": period_start,
-                        "period_end": period_end,
-                        "forecast_qty": round(float(forecast_qty), 2),
-                        "forecast_qty_lower": round(float(forecast_qty_lower), 2),
-                        "forecast_qty_upper": round(float(forecast_qty_upper), 2),
-                        "generated_at": datetime.now(),
-                        "model_version": f"{self.model_version} (statistical)"
-                    })
-
-                return results
-            else:
-                return self._generate_placeholder_forecast(
-                    product_sid, timeframe, periods_ahead, product_name, category_name
-                )
+            return results
 
         except Exception as e:
             logger.error(f"Error generating statistical forecast: {str(e)}")
-            return self._generate_placeholder_forecast(
-                product_sid, timeframe, periods_ahead
+            return []
+
+    async def save_forecast(self, forecasts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        saved_predictions = []
+
+        for forecast in forecasts:
+            existing_query = await self.db.execute(
+                text("""
+                    SELECT sid FROM prediction
+                    WHERE product_sid = :product_sid
+                    AND period_start = :period_start
+                    AND period_end = :period_end
+                    AND timeframe = :timeframe
+                    AND user_sid = :user_sid
+                """),
+                {
+                    "product_sid": forecast["product_sid"],
+                    "period_start": forecast["period_start"],
+                    "period_end": forecast["period_end"],
+                    "timeframe": forecast["timeframe"].value,
+                    "user_sid": self.user_sid
+                }
             )
+            existing = existing_query.scalar_one_or_none()
 
-    def _generate_placeholder_forecast(
-            self,
-            product_sid: str,
-            timeframe: TimeFrame,
-            periods_ahead: int = 1,
-            product_name: str = "Unknown",
-            category_name: str = "Unknown"
-    ) -> List[Dict[str, Any]]:
-        today = datetime.now().date()
+            if existing:
+                await self.db.execute(
+                    text("""
+                        UPDATE prediction
+                        SET forecast_qty = :forecast_qty,
+                            forecast_qty_lower = :forecast_qty_lower,
+                            forecast_qty_upper = :forecast_qty_upper,
+                            generated_at = :generated_at,
+                            model_version = :model_version
+                        WHERE sid = :sid
+                    """),
+                    {
+                        "sid": existing,
+                        "forecast_qty": forecast["forecast_qty"],
+                        "forecast_qty_lower": forecast["forecast_qty_lower"],
+                        "forecast_qty_upper": forecast["forecast_qty_upper"],
+                        "generated_at": forecast["generated_at"],
+                        "model_version": forecast["model_version"]
+                    }
+                )
+                forecast["sid"] = existing
+            else:
+                prediction_sid = Base.generate_sid()
+                await self.db.execute(
+                    text("""
+                        INSERT INTO prediction (
+                            sid, product_sid, timeframe, period_start, period_end,
+                            forecast_qty, forecast_qty_lower, forecast_qty_upper,
+                            generated_at, model_version, user_sid, created_at
+                        ) VALUES (
+                            :sid, :product_sid, :timeframe, :period_start, :period_end,
+                            :forecast_qty, :forecast_qty_lower, :forecast_qty_upper,
+                            :generated_at, :model_version, :user_sid, :created_at
+                        )
+                    """),
+                    {
+                        "sid": prediction_sid,
+                        "product_sid": forecast["product_sid"],
+                        "timeframe": forecast["timeframe"].value,
+                        "period_start": forecast["period_start"],
+                        "period_end": forecast["period_end"],
+                        "forecast_qty": forecast["forecast_qty"],
+                        "forecast_qty_lower": forecast["forecast_qty_lower"],
+                        "forecast_qty_upper": forecast["forecast_qty_upper"],
+                        "generated_at": forecast["generated_at"],
+                        "model_version": forecast["model_version"],
+                        "user_sid": self.user_sid,
+                        "created_at": datetime.now()
+                    }
+                )
+                forecast["sid"] = prediction_sid
 
-        if timeframe == TimeFrame.DAY:
-            days_per_period = 1
-        elif timeframe == TimeFrame.WEEK:
-            days_per_period = 7
-        else:
-            days_per_period = 30
+            saved_predictions.append(forecast)
 
-        results = []
-        for i in range(periods_ahead):
-            period_start = today + timedelta(days=i * days_per_period)
-            period_end = period_start + timedelta(days=days_per_period - 1)
-
-            base_qty = float(np.random.randint(50, 150))
-
-            forecast_qty_lower = base_qty * 0.7
-            forecast_qty_upper = base_qty * 1.3
-
-            results.append({
-                "product_sid": product_sid,
-                "product_name": product_name,
-                "category_name": category_name,
-                "timeframe": timeframe,
-                "period_start": period_start,
-                "period_end": period_end,
-                "forecast_qty": base_qty,
-                "forecast_qty_lower": forecast_qty_lower,
-                "forecast_qty_upper": forecast_qty_upper,
-                "generated_at": datetime.now(),
-                "model_version": f"{self.model_version} (placeholder)"
-            })
-
-        return results
+        await self.db.commit()
+        return saved_predictions
 
     async def get_sales_trends(self,
                                product_sid: Optional[str] = None,
                                category_sid: Optional[str] = None,
                                days_back: int = 90) -> Dict[str, Any]:
         filters = []
-        params = {"min_date": datetime.now() - timedelta(days=days_back)}
+        params = {"min_date": datetime.now() - timedelta(days=days_back), "user_sid": self.user_sid}
 
         if product_sid:
             filters.append("p.sid = :product_sid")
@@ -635,9 +556,12 @@ class PredictionService:
             JOIN 
                 warehouseitem wi ON si.warehouse_item_sid = wi.sid
             JOIN 
+                upload u ON wi.upload_sid = u.sid
+            JOIN 
                 product p ON wi.product_sid = p.sid
             WHERE 
                 s.sold_at >= :min_date
+                AND u.user_sid = :user_sid
                 {where_clause}
             GROUP BY 
                 date
@@ -658,7 +582,7 @@ class PredictionService:
                         "quantity": 0,
                         "revenue": 0
                     },
-                    "trend": "stable",
+                    "trend": "no_data",
                     "insights": []
                 }
 
@@ -684,23 +608,16 @@ class PredictionService:
                 first_half_rev = df["revenue"].iloc[:half_point].mean()
                 second_half_rev = df["revenue"].iloc[half_point:].mean()
 
-                if first_half_qty > 0:
-                    qty_growth = (second_half_qty - first_half_qty) / first_half_qty * 100
-                else:
-                    qty_growth = 0
+                qty_growth = ((second_half_qty - first_half_qty) / first_half_qty * 100) if first_half_qty > 0 else 0
+                rev_growth = ((second_half_rev - first_half_rev) / first_half_rev * 100) if first_half_rev > 0 else 0
 
-                if first_half_rev > 0:
-                    rev_growth = (second_half_rev - first_half_rev) / first_half_rev * 100
-                else:
-                    rev_growth = 0
-
-                if qty_growth > 10 and rev_growth > 10:
+                if qty_growth > 20:
                     trend = "strong_growth"
-                elif qty_growth > 5 and rev_growth > 5:
+                elif qty_growth > 5:
                     trend = "growth"
-                elif qty_growth < -10 and rev_growth < -10:
+                elif qty_growth < -20:
                     trend = "strong_decline"
-                elif qty_growth < -5 and rev_growth < -5:
+                elif qty_growth < -5:
                     trend = "decline"
                 else:
                     trend = "stable"
@@ -729,16 +646,13 @@ class PredictionService:
                     "message": "Низкий уровень среднедневных продаж"
                 })
 
-            qty_growth_val = float(qty_growth) if 'qty_growth' in locals() else 0
-            rev_growth_val = float(rev_growth) if 'rev_growth' in locals() else 0
-
             return {
                 "dates": dates,
                 "quantities": quantities,
                 "revenues": revenues,
                 "growth": {
-                    "quantity": round(qty_growth_val, 2),
-                    "revenue": round(rev_growth_val, 2)
+                    "quantity": round(qty_growth, 2),
+                    "revenue": round(rev_growth, 2)
                 },
                 "trend": trend,
                 "insights": insights
@@ -757,52 +671,6 @@ class PredictionService:
                 "trend": "error",
                 "insights": []
             }
-
-    async def save_forecast(self, forecasts: List[Dict[str, Any]]) -> List[Prediction]:
-        prediction_objects = []
-
-        for forecast in forecasts:
-            prediction = Prediction(
-                sid=Base.generate_sid(),
-                product_sid=forecast["product_sid"],
-                timeframe=forecast["timeframe"],
-                period_start=forecast["period_start"],
-                period_end=forecast["period_end"],
-                forecast_qty=forecast["forecast_qty"],
-                generated_at=forecast["generated_at"],
-                model_version=forecast["model_version"]
-            )
-            self.db.add(prediction)
-            prediction_objects.append({
-                "db_obj": prediction,
-                "forecast_qty_lower": forecast.get("forecast_qty_lower"),
-                "forecast_qty_upper": forecast.get("forecast_qty_upper")
-            })
-
-        await self.db.commit()
-
-        result_predictions = []
-        for pred_info in prediction_objects:
-            pred = pred_info["db_obj"]
-            await self.db.refresh(pred)
-
-            prediction_dict = {
-                "sid": pred.sid,
-                "product_sid": pred.product_sid,
-                "timeframe": pred.timeframe,
-                "period_start": pred.period_start,
-                "period_end": pred.period_end,
-                "forecast_qty": pred.forecast_qty,
-                "generated_at": pred.generated_at,
-                "model_version": pred.model_version,
-                "product": None,
-                "forecast_qty_lower": pred_info["forecast_qty_lower"],
-                "forecast_qty_upper": pred_info["forecast_qty_upper"]
-            }
-
-            result_predictions.append(prediction_dict)
-
-        return result_predictions
 
     async def get_product_analytics(self, product_sid: str) -> Dict[str, Any]:
         try:
@@ -841,9 +709,12 @@ class PredictionService:
                     storeitem si ON s.store_item_sid = si.sid
                 JOIN 
                     warehouseitem wi ON si.warehouse_item_sid = wi.sid
+                JOIN
+                    upload u ON wi.upload_sid = u.sid
                 WHERE 
                     wi.product_sid = :product_sid
                     AND s.sold_at >= :min_date
+                    AND u.user_sid = :user_sid
                 GROUP BY 
                     month
                 ORDER BY 
@@ -851,8 +722,10 @@ class PredictionService:
             """)
 
             min_date = datetime.now() - timedelta(days=365)
-            sales_result = await self.db.execute(sales_query,
-                                                 {"product_sid": product_sid, "min_date": min_date})
+            sales_result = await self.db.execute(
+                sales_query,
+                {"product_sid": product_sid, "min_date": min_date, "user_sid": self.user_sid}
+            )
             sales_rows = sales_result.fetchall()
 
             inventory_query = text("""
@@ -865,12 +738,18 @@ class PredictionService:
                         ELSE NULL END) as avg_days_to_expiry
                 FROM 
                     warehouseitem wi
+                JOIN
+                    upload u ON wi.upload_sid = u.sid
                 WHERE 
                     wi.product_sid = :product_sid
                     AND wi.status = 'IN_STOCK'
+                    AND u.user_sid = :user_sid
             """)
 
-            inventory_result = await self.db.execute(inventory_query, {"product_sid": product_sid})
+            inventory_result = await self.db.execute(
+                inventory_query,
+                {"product_sid": product_sid, "user_sid": self.user_sid}
+            )
             inventory_data = inventory_result.fetchone()
 
             store_query = text("""
@@ -884,6 +763,8 @@ class PredictionService:
                     storeitem si
                 JOIN 
                     warehouseitem wi ON si.warehouse_item_sid = wi.sid
+                JOIN
+                    upload u ON wi.upload_sid = u.sid
                 LEFT JOIN 
                     discount d ON si.sid = d.store_item_sid 
                     AND d.starts_at <= NOW() 
@@ -891,11 +772,15 @@ class PredictionService:
                 WHERE 
                     wi.product_sid = :product_sid
                     AND si.status = 'ACTIVE'
+                    AND u.user_sid = :user_sid
                 GROUP BY 
                     wi.product_sid
             """)
 
-            store_result = await self.db.execute(store_query, {"product_sid": product_sid})
+            store_result = await self.db.execute(
+                store_query,
+                {"product_sid": product_sid, "user_sid": self.user_sid}
+            )
             store_data = store_result.fetchone()
 
             trends = await self.get_sales_trends(product_sid=product_sid)
@@ -933,14 +818,14 @@ class PredictionService:
                 if store_data and store_data.store_quantity:
                     turnover_rate = avg_monthly_sales / float(store_data.store_quantity)
                     days_of_supply = float(store_data.store_quantity) / (
-                            avg_monthly_sales / 30) if avg_monthly_sales > 0 else 0
+                                avg_monthly_sales / 30) if avg_monthly_sales > 0 else 0
                 else:
                     turnover_rate = 0
                     days_of_supply = 0
 
                 if inventory_data and inventory_data.warehouse_quantity:
                     warehouse_days_supply = float(inventory_data.warehouse_quantity) / (
-                            avg_monthly_sales / 30) if avg_monthly_sales > 0 else 0
+                                avg_monthly_sales / 30) if avg_monthly_sales > 0 else 0
                 else:
                     warehouse_days_supply = 0
 
@@ -970,11 +855,14 @@ class PredictionService:
                     storeitem si ON s.store_item_sid = si.sid
                 JOIN 
                     warehouseitem wi ON si.warehouse_item_sid = wi.sid
+                JOIN
+                    upload u ON wi.upload_sid = u.sid
                 JOIN 
                     product p ON wi.product_sid = p.sid
                 WHERE 
                     p.category_sid = :category_sid
                     AND s.sold_at >= :min_date
+                    AND u.user_sid = :user_sid
                 GROUP BY 
                     p.sid, p.name
                 ORDER BY 
@@ -984,7 +872,7 @@ class PredictionService:
 
             category_result = await self.db.execute(
                 category_query,
-                {"category_sid": prod_data.category_sid, "min_date": min_date}
+                {"category_sid": prod_data.category_sid, "min_date": min_date, "user_sid": self.user_sid}
             )
             category_rows = category_result.fetchall()
 
