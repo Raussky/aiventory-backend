@@ -144,7 +144,8 @@ async def get_forecast(
 
             return response_predictions
 
-    prediction_service = PredictionService(db)
+    # Fixed: Pass user_sid to PredictionService
+    prediction_service = PredictionService(db, current_user.sid)
     forecasts = await prediction_service.generate_forecast(
         product_sid=product_sid,
         timeframe=timeframe,
@@ -361,7 +362,8 @@ async def get_product_analytics(
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    prediction_service = PredictionService(db)
+    # Fixed: Pass user_sid to PredictionService
+    prediction_service = PredictionService(db, current_user.sid)
     analytics = await prediction_service.get_product_analytics(product_sid)
 
     if "error" in analytics:
@@ -385,7 +387,8 @@ async def get_product_trends(
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    prediction_service = PredictionService(db)
+    # Fixed: Pass user_sid to PredictionService
+    prediction_service = PredictionService(db, current_user.sid)
     trends = await prediction_service.get_sales_trends(
         product_sid=product_sid,
         days_back=days_back
@@ -793,6 +796,7 @@ async def get_loss_analytics(
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
 ):
+    # Fixed: Corrected SQL syntax error
     base_query = """
         WITH monthly_losses AS (
             SELECT 
@@ -867,7 +871,7 @@ async def get_loss_analytics(
             (SELECT json_agg(json_build_object(
                 'month', TO_CHAR(month, 'YYYY-MM'),
                 'expired', COALESCE(expired_loss, 0),
-                'discounted', COALESCE(discount'discounted', COALESCE(discount_loss, 0),
+                'discounted', COALESCE(discount_loss, 0),
                 'total', COALESCE(expired_loss + discount_loss, 0)
             ) ORDER BY month) FROM monthly_losses) as monthly_losses,
             (SELECT json_agg(json_build_object(
@@ -1158,7 +1162,8 @@ async def get_optimal_purchase(
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
 ):
-    prediction_service = PredictionService(db)
+    # Fixed: Pass user_sid to PredictionService
+    prediction_service = PredictionService(db, current_user.sid)
 
     query = text("""
         WITH sales_stats AS (
