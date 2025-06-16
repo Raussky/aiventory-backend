@@ -146,3 +146,4 @@ class Prediction(Base):
     generated_at = Column(DateTime(timezone=True), default=datetime.utcnow)
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
     model_version = Column(String, nullable=False)
+    meta_info = Column(Text, nullable=True)  # Изменено с metadata на meta_info
