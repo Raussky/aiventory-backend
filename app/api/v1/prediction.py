@@ -396,3 +396,92 @@ async def get_product_analytics(
     }
 
     return response
+
+
+# Добавьте эту проверку в начало метода get_forecast
+@router.get("/forecast/{product_sid}", response_model=List[PredictionResponse])
+async def get_forecast(
+        product_sid: str,
+        periods: int = Query(90, ge=7, le=365),
+        refresh: bool = False,
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+):
+    prediction_service = PredictionService(db, current_user.sid)
+
+    if not refresh:
+        # Проверяем существующие прогнозы
+        existing_query = await db.execute(
+            select(Prediction)
+            .options(selectinload(Prediction.product))
+            .where(
+                and_(
+                    Prediction.product_sid == product_sid,
+                    Prediction.user_sid == current_user.sid,
+                    Prediction.period_start >= datetime.now().date(),
+                    Prediction.period_end <= datetime.now().date() + timedelta(days=periods)
+                )
+            )
+            .order_by(Prediction.period_start.asc())
+        )
+        existing = existing_query.scalars().all()
+
+        if existing and len(existing) >= periods * 0.5:  # Если есть хотя бы 50% прогнозов
+            return existing
+
+    # Проверяем наличие данных о продажах
+    sales_check_query = text("""
+        SELECT COUNT(DISTINCT DATE(s.sold_at)) as sale_days
+        FROM sale s
+        JOIN storeitem si ON s.store_item_sid = si.sid
+        JOIN warehouseitem wi ON si.warehouse_item_sid = wi.sid
+        JOIN upload u ON wi.upload_sid = u.sid
+        WHERE 
+            wi.product_sid = :product_sid
+            AND u.user_sid = :user_sid
+    """)
+
+    sales_result = await db.execute(
+        sales_check_query,
+        {"product_sid": product_sid, "user_sid": current_user.sid}
+    )
+    sales_count = sales_result.scalar()
+
+    if not sales_count or sales_count < 7:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Not enough sales data to generate forecast. Found {sales_count or 0} days of sales, need at least 7."
+        )
+
+    # Генерируем новые прогнозы
+    forecasts = await prediction_service.generate_forecast(
+        product_sid=product_sid,
+        timeframe=TimeFrame.DAY,
+        periods_ahead=periods
+    )
+
+    if not forecasts:
+        raise HTTPException(
+            status_code=400,
+            detail="Failed to generate forecast. Please check the sales data."
+        )
+
+    saved_predictions = await prediction_service.save_forecast(forecasts)
+
+    # Получаем сохраненные прогнозы с информацией о продукте
+    result_query = await db.execute(
+        select(Prediction)
+        .options(selectinload(Prediction.product))
+        .where(
+            and_(
+                Prediction.product_sid == product_sid,
+                Prediction.user_sid == current_user.sid,
+                Prediction.period_start >= datetime.now().date()
+            )
+        )
+        .order_by(Prediction.period_start.asc())
+        .limit(periods)
+    )
+
+    predictions = result_query.scalars().all()
+    return predictions

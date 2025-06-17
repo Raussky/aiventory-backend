@@ -1,6 +1,6 @@
 -- =====================================================
 -- ТЕСТОВЫЙ СКРИПТ ДЛЯ ЗАПОЛНЕНИЯ ДАННЫХ
--- ДЛЯ КОНКРЕТНОГО ПОЛЬЗОВАТЕЛЯ (ИСПРАВЛЕННЫЙ V2)
+-- ДЛЯ КОНКРЕТНОГО ПОЛЬЗОВАТЕЛЯ (ФИНАЛЬНАЯ ВЕРСИЯ)
 -- =====================================================
 
 -- ВАЖНО: Замените email на реальный email вашего пользователя
@@ -8,9 +8,15 @@ DO $$
 DECLARE
     target_user_email VARCHAR := '220103378@stu.sdu.edu.kz'; -- <-- ЗАМЕНИТЕ НА СВОЙ EMAIL
     target_user_sid VARCHAR;
-    upload_sid VARCHAR;
+    v_upload_sid VARCHAR;
     category_count INTEGER;
     product_count INTEGER;
+    -- Переменные для статистики
+    stats_products INTEGER;
+    stats_warehouse_items INTEGER;
+    stats_store_items INTEGER;
+    stats_sales INTEGER;
+    stats_revenue NUMERIC;
 BEGIN
     -- Проверяем существование пользователя
     SELECT sid INTO target_user_sid
@@ -26,35 +32,36 @@ BEGIN
     -- 1. СОЗДАЕМ КАТЕГОРИИ (если их еще нет)
     INSERT INTO category (id, sid, name)
     VALUES
-        (gen_random_uuid(), substr('cat_' || md5(random()::text || 'dairy'), 1, 22), 'Молочные продукты'),
-        (gen_random_uuid(), substr('cat_' || md5(random()::text || 'bakery'), 1, 22), 'Хлебобулочные изделия'),
-        (gen_random_uuid(), substr('cat_' || md5(random()::text || 'drinks'), 1, 22), 'Напитки'),
-        (gen_random_uuid(), substr('cat_' || md5(random()::text || 'fruits'), 1, 22), 'Овощи и фрукты'),
-        (gen_random_uuid(), substr('cat_' || md5(random()::text || 'meat'), 1, 22), 'Мясо и птица'),
-        (gen_random_uuid(), substr('cat_' || md5(random()::text || 'sweets'), 1, 22), 'Кондитерские изделия'),
-        (gen_random_uuid(), substr('cat_' || md5(random()::text || 'frozen'), 1, 22), 'Замороженные продукты'),
-        (gen_random_uuid(), substr('cat_' || md5(random()::text || 'grocery'), 1, 22), 'Бакалея')
+        (gen_random_uuid(), substr('cat_' || md5(random()::text || 'dairy' || clock_timestamp()::text), 1, 22), 'Молочные продукты'),
+        (gen_random_uuid(), substr('cat_' || md5(random()::text || 'bakery' || clock_timestamp()::text), 1, 22), 'Хлебобулочные изделия'),
+        (gen_random_uuid(), substr('cat_' || md5(random()::text || 'drinks' || clock_timestamp()::text), 1, 22), 'Напитки'),
+        (gen_random_uuid(), substr('cat_' || md5(random()::text || 'fruits' || clock_timestamp()::text), 1, 22), 'Овощи и фрукты'),
+        (gen_random_uuid(), substr('cat_' || md5(random()::text || 'meat' || clock_timestamp()::text), 1, 22), 'Мясо и птица'),
+        (gen_random_uuid(), substr('cat_' || md5(random()::text || 'sweets' || clock_timestamp()::text), 1, 22), 'Кондитерские изделия'),
+        (gen_random_uuid(), substr('cat_' || md5(random()::text || 'frozen' || clock_timestamp()::text), 1, 22), 'Замороженные продукты'),
+        (gen_random_uuid(), substr('cat_' || md5(random()::text || 'grocery' || clock_timestamp()::text), 1, 22), 'Бакалея')
     ON CONFLICT (name) DO NOTHING;
 
     SELECT COUNT(*) INTO category_count FROM category;
     RAISE NOTICE 'Всего категорий в базе: %', category_count;
 
-    -- 2. СОЗДАЕМ ПРОДУКТЫ (исправлен тип currency)
+    -- 2. СОЗДАЕМ ПРОДУКТЫ С УЧЕТОМ ПОЛЬЗОВАТЕЛЕЙ
+    -- Сначала создаем общие продукты (без привязки к пользователю)
     WITH categories AS (
         SELECT sid, name FROM category
     ),
     products_to_insert AS (
         SELECT
             gen_random_uuid() as id,
-            substr('prd_' || md5(random()::text || p.name), 1, 22) as sid,
+            substr('prd_' || md5(random()::text || p.name || clock_timestamp()::text), 1, 22) as sid,
             c.sid as category_sid,
             p.name,
             p.barcode,
             p.unit as default_unit,
             p.price::float as default_price,
-            'KZT'::currency as currency, -- Исправлено: приведение к типу currency
+            'KZT'::currency as currency,
             p.storage_duration,
-            'DAY'::storagedurationtype as storage_duration_type -- Исправлено: приведение к enum типу
+            'DAY'::storagedurationtype as storage_duration_type
         FROM (
             VALUES
                 -- Молочные продукты
@@ -116,21 +123,21 @@ BEGIN
     RAISE NOTICE 'Всего продуктов в базе: %', product_count;
 
     -- 3. СОЗДАЕМ ЗАГРУЗКУ
-    upload_sid := substr('upl_' || md5(target_user_sid || NOW()::text), 1, 22);
+    v_upload_sid := substr('upl_' || md5(target_user_sid || NOW()::text), 1, 22);
 
     INSERT INTO upload (id, sid, user_sid, file_name, uploaded_at, rows_imported)
     VALUES (
         gen_random_uuid(),
-        upload_sid,
+        v_upload_sid,
         target_user_sid,
         'test_import_' || to_char(NOW(), 'YYYYMMDD_HH24MI') || '.xlsx',
         NOW() - INTERVAL '120 days',
         product_count
     );
 
-    RAISE NOTICE 'Создана загрузка: %', upload_sid;
+    RAISE NOTICE 'Создана загрузка: %', v_upload_sid;
 
-    -- 4. СОЗДАЕМ ТОВАРЫ НА СКЛАДЕ И СРАЗУ В МАГАЗИНЕ (история за 120 дней)
+    -- 4. СОЗДАЕМ ТОВАРЫ НА СКЛАДЕ И В МАГАЗИНЕ С ПОЛНОЙ ИСТОРИЕЙ
     WITH date_series AS (
         SELECT generate_series(
             CURRENT_DATE - INTERVAL '119 days',
@@ -138,69 +145,71 @@ BEGIN
             INTERVAL '1 day'
         )::date as supply_date
     ),
-    products_list AS (
+    all_products AS (
         SELECT sid, name, default_price, storage_duration, barcode
         FROM product
-        WHERE barcode IN (
-            '4607002991234', '4607002991239', '4607002991243', '4607002991248',
-            '4607002991253', '4607002991257', '4607002991260', '4607002991262'
-        )
     ),
     warehouse_inserts AS (
         INSERT INTO warehouseitem (id, sid, upload_sid, product_sid, batch_code, quantity, expire_date, received_at, status, urgency_level)
         SELECT
             gen_random_uuid(),
-            substr('whi_' || md5(random()::text || p.sid || ds.supply_date), 1, 22),
-            upload_sid,
+            substr('whi_' || md5(random()::text || p.sid || ds.supply_date || clock_timestamp()::text), 1, 22),
+            v_upload_sid,
             p.sid,
             'BATCH' || to_char(ds.supply_date, 'YYYYMMDD'),
             CASE
-                WHEN p.barcode = '4607002991234' THEN 200  -- Молоко - большие партии
-                WHEN p.barcode = '4607002991239' THEN 150  -- Хлеб
-                WHEN p.barcode = '4607002991243' THEN 100  -- Кока-кола
-                WHEN p.barcode = '4607002991248' THEN 80   -- Яблоки
-                WHEN p.barcode = '4607002991253' THEN 50   -- Курица
-                ELSE 60
+                WHEN p.barcode IN ('4607002991234', '4607002991239') THEN 150 + (random() * 50)::int
+                WHEN p.barcode IN ('4607002991243', '4607002991244', '4607002991245') THEN 100 + (random() * 30)::int
+                WHEN p.barcode IN ('4607002991248', '4607002991249', '4607002991250') THEN 80 + (random() * 20)::int
+                ELSE 60 + (random() * 20)::int
             END,
             ds.supply_date + (p.storage_duration || ' days')::interval,
             ds.supply_date,
-            'MOVED'::warehouseitemstatus,  -- Приведение к enum типу
-            'NORMAL'::urgencylevel          -- Приведение к enum типу
-        FROM products_list p
+            'MOVED'::warehouseitemstatus,
+            'NORMAL'::urgencylevel
+        FROM all_products p
         CROSS JOIN date_series ds
         WHERE
-            -- Поставки не каждый день, а периодически
-            (p.barcode = '4607002991234' AND EXTRACT(DAY FROM ds.supply_date)::integer % 3 = 0) OR  -- Молоко каждые 3 дня
-            (p.barcode = '4607002991239' AND EXTRACT(DAY FROM ds.supply_date)::integer % 2 = 0) OR  -- Хлеб каждые 2 дня
-            (p.barcode = '4607002991243' AND EXTRACT(DAY FROM ds.supply_date)::integer % 7 = 0) OR  -- Кола раз в неделю
-            (p.barcode = '4607002991248' AND EXTRACT(DAY FROM ds.supply_date)::integer % 5 = 0) OR  -- Яблоки каждые 5 дней
+            -- Генерируем поставки для всех товаров с разной периодичностью
+            (p.barcode = '4607002991234' AND EXTRACT(DAY FROM ds.supply_date)::integer % 2 = 0) OR  -- Молоко каждые 2 дня
+            (p.barcode = '4607002991239' AND EXTRACT(DAY FROM ds.supply_date)::integer % 1 = 0) OR  -- Хлеб каждый день
+            (p.barcode = '4607002991243' AND EXTRACT(DAY FROM ds.supply_date)::integer % 5 = 0) OR  -- Кола каждые 5 дней
+            (p.barcode = '4607002991244' AND EXTRACT(DAY FROM ds.supply_date)::integer % 7 = 0) OR  -- Сок каждую неделю
+            (p.barcode = '4607002991245' AND EXTRACT(DAY FROM ds.supply_date)::integer % 3 = 0) OR  -- Вода каждые 3 дня
+            (p.barcode = '4607002991248' AND EXTRACT(DAY FROM ds.supply_date)::integer % 4 = 0) OR  -- Яблоки каждые 4 дня
+            (p.barcode = '4607002991249' AND EXTRACT(DAY FROM ds.supply_date)::integer % 3 = 0) OR  -- Бананы каждые 3 дня
+            (p.barcode = '4607002991250' AND EXTRACT(DAY FROM ds.supply_date)::integer % 5 = 0) OR  -- Помидоры каждые 5 дней
             (p.barcode = '4607002991253' AND EXTRACT(DAY FROM ds.supply_date)::integer % 4 = 0) OR  -- Курица каждые 4 дня
-            (p.barcode = '4607002991257' AND EXTRACT(DAY FROM ds.supply_date)::integer % 14 = 0) OR -- Шоколад раз в 2 недели
-            (p.barcode = '4607002991260' AND EXTRACT(DAY FROM ds.supply_date)::integer % 10 = 0) OR -- Пельмени каждые 10 дней
-            (p.barcode = '4607002991262' AND EXTRACT(DAY FROM ds.supply_date)::integer % 21 = 0)    -- Макароны раз в 3 недели
+            (p.barcode = '4607002991257' AND EXTRACT(DAY FROM ds.supply_date)::integer % 10 = 0) OR -- Шоколад каждые 10 дней
+            (p.barcode = '4607002991260' AND EXTRACT(DAY FROM ds.supply_date)::integer % 7 = 0) OR  -- Пельмени каждую неделю
+            (p.barcode = '4607002991262' AND EXTRACT(DAY FROM ds.supply_date)::integer % 14 = 0)    -- Макароны каждые 2 недели
         RETURNING sid, product_sid, quantity, received_at, (SELECT default_price FROM product WHERE sid = product_sid) as price
     )
     INSERT INTO storeitem (id, sid, warehouse_item_sid, quantity, price, moved_at, status)
     SELECT
         gen_random_uuid(),
-        substr('sti_' || md5(random()::text || wi.sid), 1, 22),
+        substr('sti_' || md5(random()::text || wi.sid || clock_timestamp()::text), 1, 22),
         wi.sid,
         wi.quantity,
-        wi.price * 1.35, -- Наценка 35%
+        wi.price * 1.35,
         wi.received_at + INTERVAL '2 hours',
-        'ACTIVE'::storeitemstatus  -- Приведение к enum типу
+        'ACTIVE'::storeitemstatus
     FROM warehouse_inserts wi;
 
     RAISE NOTICE 'Создана история поставок и перемещений в магазин';
 
-    -- 5. ГЕНЕРИРУЕМ РЕАЛИСТИЧНУЮ ИСТОРИЮ ПРОДАЖ
+    -- 5. ГЕНЕРИРУЕМ ПОДРОБНУЮ ИСТОРИЮ ПРОДАЖ ДЛЯ ВСЕХ ТОВАРОВ
     WITH store_items AS (
         SELECT
             si.sid,
             si.price,
+            si.quantity as initial_quantity,
+            si.moved_at,
             p.name,
             p.barcode,
-            wi.received_at
+            p.sid as product_sid,
+            wi.received_at,
+            wi.expire_date
         FROM storeitem si
         JOIN warehouseitem wi ON si.warehouse_item_sid = wi.sid
         JOIN product p ON wi.product_sid = p.sid
@@ -212,78 +221,73 @@ BEGIN
             si.sid as store_item_sid,
             si.price,
             si.name,
+            si.product_sid,
             gs.sale_date,
             EXTRACT(DOW FROM gs.sale_date) as day_of_week,
             EXTRACT(MONTH FROM gs.sale_date) as month,
-            -- Базовое количество продаж с учетом типа товара и дня недели
-            CASE
-                -- Молоко - стабильные ежедневные продажи
-                WHEN si.barcode = '4607002991234' THEN
-                    CASE
-                        WHEN EXTRACT(DOW FROM gs.sale_date) IN (0, 6) THEN 25 + (5 * sin(EXTRACT(DOY FROM gs.sale_date)::numeric / 10))::int + (random() * 10)::int
-                        ELSE 15 + (3 * sin(EXTRACT(DOY FROM gs.sale_date)::numeric / 10))::int + (random() * 5)::int
-                    END
-                -- Хлеб - высокие продажи, особенно утром
-                WHEN si.barcode = '4607002991239' THEN
-                    CASE
-                        WHEN EXTRACT(DOW FROM gs.sale_date) IN (0, 6) THEN 40 + (random() * 15)::int
-                        ELSE 30 + (random() * 10)::int
-                    END
-                -- Кола - больше летом и в выходные
-                WHEN si.barcode = '4607002991243' THEN
-                    CASE
-                        WHEN EXTRACT(MONTH FROM gs.sale_date) IN (6, 7, 8) THEN 20 + (random() * 10)::int
-                        WHEN EXTRACT(DOW FROM gs.sale_date) IN (0, 6) THEN 15 + (random() * 8)::int
-                        ELSE 8 + (random() * 5)::int
-                    END
-                -- Яблоки - сезонность
-                WHEN si.barcode = '4607002991248' THEN
-                    CASE
-                        WHEN EXTRACT(MONTH FROM gs.sale_date) IN (9, 10, 11) THEN 15 + (random() * 8)::int
-                        ELSE 8 + (random() * 5)::int
-                    END
-                -- Курица - стабильный спрос
-                WHEN si.barcode = '4607002991253' THEN
-                    CASE
-                        WHEN EXTRACT(DOW FROM gs.sale_date) IN (5, 6) THEN 12 + (random() * 6)::int
-                        ELSE 6 + (random() * 4)::int
-                    END
-                -- Шоколад - импульсные покупки
-                WHEN si.barcode = '4607002991257' THEN
-                    (3 + (random() * 5)::int) * (CASE WHEN random() > 0.7 THEN 2 ELSE 1 END)
-                -- Пельмени - больше в холодное время
-                WHEN si.barcode = '4607002991260' THEN
-                    CASE
-                        WHEN EXTRACT(MONTH FROM gs.sale_date) IN (11, 12, 1, 2) THEN 8 + (random() * 4)::int
-                        ELSE 4 + (random() * 3)::int
-                    END
-                -- Макароны - стабильные продажи
-                WHEN si.barcode = '4607002991262' THEN
-                    4 + (random() * 3)::int
-                ELSE
-                    5 + (random() * 3)::int
-            END as quantity
+            -- Генерируем количество продаж с учетом типа товара, дня недели и сезонности
+            GREATEST(1, LEAST(
+                si.initial_quantity / GREATEST(1, (CURRENT_DATE - si.received_at::date)::numeric),
+                CASE
+                    -- Молоко - стабильные ежедневные продажи
+                    WHEN si.barcode = '4607002991234' THEN
+                        CASE
+                            WHEN EXTRACT(DOW FROM gs.sale_date) IN (0, 6) THEN 30 + (random() * 15)::int
+                            ELSE 20 + (random() * 10)::int
+                        END
+                    -- Хлеб - высокие продажи каждый день
+                    WHEN si.barcode = '4607002991239' THEN
+                        CASE
+                            WHEN EXTRACT(DOW FROM gs.sale_date) IN (0, 6) THEN 50 + (random() * 20)::int
+                            ELSE 35 + (random() * 15)::int
+                        END
+                    -- Напитки - сезонность и выходные
+                    WHEN si.barcode IN ('4607002991243', '4607002991244', '4607002991245') THEN
+                        CASE
+                            WHEN EXTRACT(MONTH FROM gs.sale_date) IN (6, 7, 8) THEN 25 + (random() * 15)::int
+                            WHEN EXTRACT(DOW FROM gs.sale_date) IN (0, 6) THEN 20 + (random() * 10)::int
+                            ELSE 10 + (random() * 8)::int
+                        END
+                    -- Овощи и фрукты - сезонные колебания
+                    WHEN si.barcode IN ('4607002991248', '4607002991249', '4607002991250') THEN
+                        CASE
+                            WHEN EXTRACT(MONTH FROM gs.sale_date) IN (7, 8, 9) THEN 20 + (random() * 10)::int
+                            ELSE 10 + (random() * 8)::int
+                        END
+                    -- Мясо - больше продаж в выходные
+                    WHEN si.barcode = '4607002991253' THEN
+                        CASE
+                            WHEN EXTRACT(DOW FROM gs.sale_date) IN (5, 6, 0) THEN 15 + (random() * 10)::int
+                            ELSE 8 + (random() * 5)::int
+                        END
+                    -- Кондитерские изделия - импульсные покупки
+                    WHEN si.barcode = '4607002991257' THEN
+                        (5 + (random() * 8)::int) * (CASE WHEN random() > 0.6 THEN 2 ELSE 1 END)
+                    -- Замороженные продукты - зимой больше
+                    WHEN si.barcode = '4607002991260' THEN
+                        CASE
+                            WHEN EXTRACT(MONTH FROM gs.sale_date) IN (11, 12, 1, 2) THEN 10 + (random() * 5)::int
+                            ELSE 5 + (random() * 3)::int
+                        END
+                    -- Остальные товары
+                    ELSE
+                        8 + (random() * 5)::int
+                END
+            ))::int as quantity
         FROM store_items si
         CROSS JOIN generate_series(
             si.received_at::date,
-            LEAST(CURRENT_DATE, si.received_at::date + INTERVAL '119 days'),
+            LEAST(CURRENT_DATE - INTERVAL '1 day', si.received_at::date + INTERVAL '118 days'),
             INTERVAL '1 day'
         ) AS gs(sale_date)
         WHERE
-            -- Не продаем в день поставки для некоторых товаров
-            (si.barcode NOT IN ('4607002991234', '4607002991239') OR gs.sale_date > si.received_at::date)
-            -- Вероятность отсутствия продаж
-            AND (
-                (si.barcode = '4607002991257' AND random() > 0.3) OR  -- Шоколад продается не каждый день
-                (si.barcode = '4607002991260' AND random() > 0.2) OR  -- Пельмени тоже
-                (si.barcode = '4607002991262' AND random() > 0.25) OR -- Макароны
-                (si.barcode NOT IN ('4607002991257', '4607002991260', '4607002991262'))
-            )
+            -- Продаем только активные товары и до истечения срока годности
+            (si.expire_date IS NULL OR gs.sale_date <= si.expire_date - INTERVAL '1 day')
     )
     INSERT INTO sale (id, sid, store_item_sid, sold_qty, sold_price, sold_at, cashier_sid)
     SELECT
         gen_random_uuid(),
-        substr('sal_' || md5(random()::text || sg.store_item_sid || sg.sale_date), 1, 22),
+        substr('sal_' || md5(random()::text || sg.store_item_sid || sg.sale_date || clock_timestamp()::text), 1, 22),
         sg.store_item_sid,
         sg.quantity,
         sg.price,
@@ -299,7 +303,7 @@ BEGIN
     FROM sales_generator sg
     WHERE sg.quantity > 0;
 
-    RAISE NOTICE 'Создана история продаж';
+    RAISE NOTICE 'Создана подробная история продаж';
 
     -- 6. ОБНОВЛЯЕМ ОСТАТКИ В МАГАЗИНЕ
     UPDATE storeitem si
@@ -319,27 +323,75 @@ BEGIN
         AND u.user_sid = target_user_sid
     );
 
-    -- 7. ВЫВОДИМ ИТОГОВУЮ СТАТИСТИКУ
-    RAISE NOTICE '=== ИТОГОВАЯ СТАТИСТИКА ДЛЯ ПОЛЬЗОВАТЕЛЯ % ===', target_user_email;
-
-    PERFORM (
-        SELECT
-            COUNT(DISTINCT p.sid) as products,
-            COUNT(DISTINCT wi.sid) as warehouse_items,
-            COUNT(DISTINCT si.sid) as store_items,
-            COUNT(DISTINCT s.sid) as sales,
-            SUM(s.sold_qty * s.sold_price) as revenue
-        FROM sale s
-        JOIN storeitem si ON s.store_item_sid = si.sid
-        JOIN warehouseitem wi ON si.warehouse_item_sid = wi.sid
-        JOIN product p ON wi.product_sid = p.sid
-        JOIN upload u ON wi.upload_sid = u.sid
-        WHERE u.user_sid = target_user_sid
+    -- 7. СОЗДАЕМ АКТУАЛЬНЫЕ ТОВАРЫ НА СКЛАДЕ ДЛЯ ТЕКУЩЕЙ РАБОТЫ
+    INSERT INTO warehouseitem (id, sid, upload_sid, product_sid, batch_code, quantity, expire_date, received_at, status, urgency_level)
+    SELECT
+        gen_random_uuid(),
+        substr('whi_curr_' || md5(random()::text || p.sid || CURRENT_DATE || clock_timestamp()::text), 1, 22),
+        v_upload_sid,
+        p.sid,
+        'BATCH' || to_char(CURRENT_DATE, 'YYYYMMDD'),
+        CASE
+            WHEN p.barcode = '4607002991234' THEN 100
+            WHEN p.barcode = '4607002991239' THEN 80
+            WHEN p.barcode = '4607002991243' THEN 60
+            WHEN p.barcode = '4607002991244' THEN 50
+            WHEN p.barcode = '4607002991245' THEN 70
+            WHEN p.barcode = '4607002991248' THEN 40
+            WHEN p.barcode = '4607002991249' THEN 45
+            WHEN p.barcode = '4607002991250' THEN 35
+            WHEN p.barcode = '4607002991253' THEN 30
+            ELSE 25
+        END,
+        CURRENT_DATE + (p.storage_duration || ' days')::interval,
+        CURRENT_DATE,
+        'IN_STOCK'::warehouseitemstatus,
+        'NORMAL'::urgencylevel
+    FROM product p
+    WHERE p.barcode IN (
+        '4607002991234', '4607002991239', '4607002991243', '4607002991244',
+        '4607002991245', '4607002991248', '4607002991249', '4607002991250',
+        '4607002991253', '4607002991257', '4607002991260', '4607002991262'
     );
 
-    RAISE NOTICE 'Данные успешно созданы!';
-    RAISE NOTICE 'Теперь вы можете использовать систему прогнозирования Prophet';
+    RAISE NOTICE 'Добавлены текущие товары на склад для работы с системой';
 
+    -- 8. СОБИРАЕМ СТАТИСТИКУ
+    SELECT
+        COUNT(DISTINCT p.sid),
+        COUNT(DISTINCT wi.sid),
+        COUNT(DISTINCT si.sid),
+        COUNT(DISTINCT s.sid),
+        COALESCE(SUM(s.sold_qty * s.sold_price), 0)
+    INTO
+        stats_products,
+        stats_warehouse_items,
+        stats_store_items,
+        stats_sales,
+        stats_revenue
+    FROM sale s
+    JOIN storeitem si ON s.store_item_sid = si.sid
+    JOIN warehouseitem wi ON si.warehouse_item_sid = wi.sid
+    JOIN product p ON wi.product_sid = p.sid
+    JOIN upload u ON wi.upload_sid = u.sid
+    WHERE u.user_sid = target_user_sid;
+
+    -- Выводим итоговую статистику
+    RAISE NOTICE '=== ИТОГОВАЯ СТАТИСТИКА ДЛЯ ПОЛЬЗОВАТЕЛЯ % ===', target_user_email;
+    RAISE NOTICE 'Уникальных продуктов: %', stats_products;
+    RAISE NOTICE 'Записей на складе: %', stats_warehouse_items;
+    RAISE NOTICE 'Записей в магазине: %', stats_store_items;
+    RAISE NOTICE 'Продаж: %', stats_sales;
+    RAISE NOTICE 'Общая выручка: %', stats_revenue;
+    RAISE NOTICE '';
+    RAISE NOTICE 'Данные успешно созданы!';
+    RAISE NOTICE 'Теперь вы можете использовать систему прогнозирования';
+
+EXCEPTION
+    WHEN OTHERS THEN
+        RAISE NOTICE 'Произошла ошибка: %', SQLERRM;
+        RAISE NOTICE 'SQLSTATE: %', SQLSTATE;
+        RAISE;
 END $$;
 
 -- Проверка созданных данных
@@ -360,12 +412,13 @@ LEFT JOIN sale s ON si.sid = s.store_item_sid
 WHERE u.email = '220103378@stu.sdu.edu.kz'  -- <-- ЗАМЕНИТЕ НА СВОЙ EMAIL
 GROUP BY u.email;
 
--- Топ продаваемых товаров
+-- Проверка данных для прогнозирования
 SELECT
     p.name as product_name,
     COUNT(DISTINCT DATE(s.sold_at)) as sale_days,
     SUM(s.sold_qty) as total_quantity,
-    SUM(s.sold_qty * s.sold_price)::numeric(10,2) as total_revenue,
+    MIN(DATE(s.sold_at)) as first_sale_date,
+    MAX(DATE(s.sold_at)) as last_sale_date,
     AVG(s.sold_qty)::numeric(10,2) as avg_daily_sales
 FROM sale s
 JOIN storeitem si ON s.store_item_sid = si.sid
@@ -374,6 +427,6 @@ JOIN product p ON wi.product_sid = p.sid
 JOIN upload u ON wi.upload_sid = u.sid
 JOIN "user" usr ON u.user_sid = usr.sid
 WHERE usr.email = '220103378@stu.sdu.edu.kz'  -- <-- ЗАМЕНИТЕ НА СВОЙ EMAIL
-GROUP BY p.name
-ORDER BY total_quantity DESC
-LIMIT 10;
+GROUP BY p.sid, p.name
+HAVING COUNT(DISTINCT DATE(s.sold_at)) >= 14
+ORDER BY sale_days DESC;
