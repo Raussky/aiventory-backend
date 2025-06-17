@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import text
+from sqlalchemy import text, and_
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 import pandas as pd
@@ -212,6 +212,7 @@ async def get_category_sales(
 @router.get("/forecast/{product_sid}", response_model=List[PredictionResponse])
 async def get_forecast(
         product_sid: str,
+        periods: int = Query(90, ge=7, le=365),
         refresh: bool = False,
         current_user: User = Depends(get_current_user),
         db: AsyncSession = Depends(get_db),
@@ -219,25 +220,30 @@ async def get_forecast(
     prediction_service = PredictionService(db, current_user.sid)
 
     if not refresh:
+        # Проверяем существующие прогнозы
         existing_query = await db.execute(
             select(Prediction)
+            .options(selectinload(Prediction.product))
             .where(
-                Prediction.product_sid == product_sid,
-                Prediction.user_sid == current_user.sid,
-                Prediction.period_start >= datetime.now().date()
+                and_(
+                    Prediction.product_sid == product_sid,
+                    Prediction.user_sid == current_user.sid,
+                    Prediction.period_start >= datetime.now().date(),
+                    Prediction.period_end <= datetime.now().date() + timedelta(days=periods)
+                )
             )
             .order_by(Prediction.period_start.asc())
-            .limit(30)
         )
         existing = existing_query.scalars().all()
 
-        if existing and len(existing) >= 7:
+        if existing and len(existing) >= periods * 0.8:  # Если есть хотя бы 80% прогнозов
             return existing
 
+    # Генерируем новые прогнозы
     forecasts = await prediction_service.generate_forecast(
         product_sid=product_sid,
         timeframe=TimeFrame.DAY,
-        periods_ahead=30
+        periods_ahead=periods
     )
 
     if not forecasts:
@@ -248,19 +254,145 @@ async def get_forecast(
 
     saved_predictions = await prediction_service.save_forecast(forecasts)
 
-    predictions = []
-    for pred in saved_predictions:
-        predictions.append(PredictionResponse(
-            sid=pred["sid"],
-            product_sid=pred["product_sid"],
-            timeframe=pred["timeframe"],
-            period_start=pred["period_start"],
-            period_end=pred["period_end"],
-            forecast_qty=pred["forecast_qty"],
-            generated_at=pred["generated_at"],
-            model_version=pred["model_version"],
-            forecast_qty_lower=pred.get("forecast_qty_lower", pred["forecast_qty"] * 0.8),
-            forecast_qty_upper=pred.get("forecast_qty_upper", pred["forecast_qty"] * 1.2)
-        ))
+    # Получаем сохраненные прогнозы с информацией о продукте
+    result_query = await db.execute(
+        select(Prediction)
+        .options(selectinload(Prediction.product))
+        .where(
+            and_(
+                Prediction.product_sid == product_sid,
+                Prediction.user_sid == current_user.sid,
+                Prediction.period_start >= datetime.now().date()
+            )
+        )
+        .order_by(Prediction.period_start.asc())
+        .limit(periods)
+    )
 
+    predictions = result_query.scalars().all()
     return predictions
+
+
+@router.get("/analytics/{product_sid}", response_model=Dict[str, Any])
+async def get_product_analytics(
+        product_sid: str,
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+):
+    """Получить полную аналитику по продукту включая прогнозы на 3 месяца"""
+
+    # Получаем информацию о продукте
+    product_query = await db.execute(
+        select(Product)
+        .options(selectinload(Product.category))
+        .where(Product.sid == product_sid)
+    )
+    product = product_query.scalar_one_or_none()
+
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    # Получаем историю продаж за последние 90 дней
+    sales_history = await get_sales_history(
+        product_sid=product_sid,
+        days_back=90,
+        current_user=current_user,
+        db=db
+    )
+
+    # Получаем прогнозы на 90 дней вперед
+    forecasts = await get_forecast(
+        product_sid=product_sid,
+        periods=90,
+        refresh=False,
+        current_user=current_user,
+        db=db
+    )
+
+    # Рассчитываем статистику
+    analytics_query = text("""
+        WITH sales_stats AS (
+            SELECT 
+                COUNT(DISTINCT DATE(s.sold_at)) as sale_days,
+                SUM(s.sold_qty) as total_quantity,
+                SUM(s.sold_qty * s.sold_price) as total_revenue,
+                AVG(s.sold_qty) as avg_daily_quantity,
+                STDDEV(s.sold_qty) as std_daily_quantity,
+                MAX(s.sold_at) as last_sale_date
+            FROM sale s
+            JOIN storeitem si ON s.store_item_sid = si.sid
+            JOIN warehouseitem wi ON si.warehouse_item_sid = wi.sid
+            JOIN upload u ON wi.upload_sid = u.sid
+            WHERE 
+                wi.product_sid = :product_sid
+                AND u.user_sid = :user_sid
+                AND s.sold_at >= :min_date
+        ),
+        inventory_stats AS (
+            SELECT 
+                COALESCE(SUM(wi.quantity), 0) as warehouse_quantity,
+                COALESCE(SUM(si.quantity), 0) as store_quantity
+            FROM warehouseitem wi
+            LEFT JOIN storeitem si ON wi.sid = si.warehouse_item_sid AND si.status = 'ACTIVE'
+            JOIN upload u ON wi.upload_sid = u.sid
+            WHERE 
+                wi.product_sid = :product_sid
+                AND wi.status = 'IN_STOCK'
+                AND u.user_sid = :user_sid
+        )
+        SELECT 
+            ss.*,
+            ins.warehouse_quantity,
+            ins.store_quantity
+        FROM sales_stats ss
+        CROSS JOIN inventory_stats ins
+    """)
+
+    stats_result = await db.execute(
+        analytics_query,
+        {
+            "product_sid": product_sid,
+            "user_sid": current_user.sid,
+            "min_date": datetime.now() - timedelta(days=90)
+        }
+    )
+    stats = stats_result.fetchone()
+
+    # Формируем ответ
+    response = {
+        "product": {
+            "sid": product.sid,
+            "name": product.name,
+            "category": product.category.name if product.category else None,
+            "barcode": product.barcode
+        },
+        "current_inventory": {
+            "warehouse": int(stats.warehouse_quantity) if stats else 0,
+            "store": int(stats.store_quantity) if stats else 0,
+            "total": int((stats.warehouse_quantity or 0) + (stats.store_quantity or 0)) if stats else 0
+        },
+        "sales_statistics": {
+            "total_quantity": float(stats.total_quantity) if stats and stats.total_quantity else 0,
+            "total_revenue": float(stats.total_revenue) if stats and stats.total_revenue else 0,
+            "avg_daily_quantity": float(stats.avg_daily_quantity) if stats and stats.avg_daily_quantity else 0,
+            "sale_days": int(stats.sale_days) if stats and stats.sale_days else 0,
+            "last_sale_date": stats.last_sale_date.isoformat() if stats and stats.last_sale_date else None
+        },
+        "sales_history": sales_history,
+        "forecast_90_days": [
+            {
+                "date": pred.period_start.isoformat(),
+                "forecast_qty": pred.forecast_qty,
+                "forecast_qty_lower": pred.forecast_qty_lower,
+                "forecast_qty_upper": pred.forecast_qty_upper
+            }
+            for pred in forecasts
+        ],
+        "forecast_summary": {
+            "next_7_days": sum(p.forecast_qty for p in forecasts[:7]),
+            "next_30_days": sum(p.forecast_qty for p in forecasts[:30]),
+            "next_90_days": sum(p.forecast_qty for p in forecasts[:90])
+        }
+    }
+
+    return response
