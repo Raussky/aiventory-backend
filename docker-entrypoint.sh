@@ -1,33 +1,23 @@
 #!/bin/bash
-# /docker-entrypoint.sh
 set -e
 
-echo "Activating conda environment..."
-source /opt/conda/etc/profile.d/conda.sh
-conda activate inventory
-
-# Wait for PostgreSQL to be ready
-echo "Waiting for PostgreSQL..."
-until PGPASSWORD=$POSTGRES_PASSWORD psql -h "$POSTGRES_SERVER" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c '\q'; do
+echo "Waiting for PostgreSQL to be ready..."
+until PGPASSWORD=$POSTGRES_PASSWORD psql -h "$POSTGRES_SERVER" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c '\q' 2>/dev/null; do
   echo "PostgreSQL is unavailable - sleeping"
-  sleep 1
+  sleep 2
 done
-echo "PostgreSQL is up - continuing"
+echo "PostgreSQL is up!"
 
-# Wait for Redis if needed
-if [ ! -z "$REDIS_HOST" ]; then
-  echo "Waiting for Redis..."
-  until redis-cli -h $REDIS_HOST -p $REDIS_PORT --raw ping 2>/dev/null; do
-    echo "Redis is unavailable - sleeping"
-    sleep 1
-  done
-  echo "Redis is up - continuing"
-fi
+echo "Waiting for Redis to be ready..."
+until redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" ${REDIS_PASSWORD:+-a "$REDIS_PASSWORD"} ping 2>/dev/null | grep -q PONG; do
+  echo "Redis is unavailable - sleeping"
+  sleep 2
+done
+echo "Redis is up!"
 
-# Run database migrations
 echo "Running database migrations..."
 alembic upgrade head
+echo "Migrations completed!"
 
-# Start the application
 echo "Starting application..."
 exec "$@"

@@ -41,30 +41,6 @@ services:
     networks:
       - inventory_network
 
-  # Миграции запускаются отдельно
-  migrations:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: inventory_migrations
-    environment:
-      # Database
-      POSTGRES_SERVER: postgres
-      POSTGRES_PORT: 5432
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-      POSTGRES_DB: ${POSTGRES_DB:-inventory}
-      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-inventory}
-    volumes:
-      - ./alembic:/app/alembic:ro
-      - ./app:/app/app:ro
-    depends_on:
-      postgres:
-        condition: service_healthy
-    networks:
-      - inventory_network
-    command: /scripts/migrate.sh
-
   api:
     build:
       context: .
@@ -113,8 +89,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      migrations:
-        condition: service_completed_successfully
     networks:
       - inventory_network
     healthcheck:
@@ -125,7 +99,7 @@ services:
       start_period: 40s
     restart: unless-stopped
 
-  # Celery воркер (опционально)
+  # Celery воркер
   celery_worker:
     build:
       context: .
@@ -154,19 +128,18 @@ services:
       EMAILS_FROM_NAME: ${EMAILS_FROM_NAME:-AIventory System}
     volumes:
       - ./app:/app/app:ro
+      - ./alembic:/app/alembic:ro
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-      migrations:
-        condition: service_completed_successfully
     networks:
       - inventory_network
     command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=${CELERY_CONCURRENCY:-2}
     restart: unless-stopped
 
-  # Celery beat scheduler (опционально)
+  # Celery beat scheduler
   celery_beat:
     build:
       context: .
@@ -185,13 +158,12 @@ services:
       SECRET_KEY: ${SECRET_KEY:-your-secret-key-here}
     volumes:
       - ./app:/app/app:ro
+      - ./alembic:/app/alembic:ro
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-      migrations:
-        condition: service_completed_successfully
     networks:
       - inventory_network
     command: celery -A app.tasks.celery_app beat --loglevel=info
