@@ -220,22 +220,49 @@ async def get_forecast(
     prediction_service = PredictionService(db, current_user.sid)
 
     if not refresh:
-        existing_query = await db.execute(
-            select(Prediction)
-            .options(
-                selectinload(Prediction.product).selectinload(Product.category)
-            )
-            .where(
-                and_(
-                    Prediction.product_sid == product_sid,
-                    Prediction.user_sid == current_user.sid,
-                    Prediction.period_start >= datetime.now().date(),
-                    Prediction.period_end <= datetime.now().date() + timedelta(days=periods)
+        check_column_query = text("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'prediction' 
+            AND column_name = 'user_sid'
+        """)
+
+        column_result = await db.execute(check_column_query)
+        has_user_sid_column = column_result.scalar() is not None
+
+        if has_user_sid_column:
+            existing_query = await db.execute(
+                select(Prediction)
+                .options(
+                    selectinload(Prediction.product).selectinload(Product.category)
                 )
+                .where(
+                    and_(
+                        Prediction.product_sid == product_sid,
+                        Prediction.user_sid == current_user.sid,
+                        Prediction.period_start >= datetime.now().date(),
+                        Prediction.period_end <= datetime.now().date() + timedelta(days=periods)
+                    )
+                )
+                .order_by(Prediction.period_start.asc())
             )
-            .order_by(Prediction.period_start.asc())
-        )
-        existing = existing_query.scalars().all()
+        else:
+            existing_query = await db.execute(
+                text("""
+                    SELECT p.* FROM prediction p
+                    WHERE p.product_sid = :product_sid
+                    AND p.period_start >= :start_date
+                    AND p.period_end <= :end_date
+                    ORDER BY p.period_start ASC
+                """),
+                {
+                    "product_sid": product_sid,
+                    "start_date": datetime.now().date(),
+                    "end_date": datetime.now().date() + timedelta(days=periods)
+                }
+            )
+
+        existing = existing_query.scalars().all() if has_user_sid_column else []
 
         if existing and len(existing) >= periods * 0.5:
             return existing
@@ -277,21 +304,47 @@ async def get_forecast(
 
     saved_predictions = await prediction_service.save_forecast(forecasts)
 
-    result_query = await db.execute(
-        select(Prediction)
-        .options(
-            selectinload(Prediction.product).selectinload(Product.category)
-        )
-        .where(
-            and_(
-                Prediction.product_sid == product_sid,
-                Prediction.user_sid == current_user.sid,
-                Prediction.period_start >= datetime.now().date()
+    check_column_query = text("""
+        SELECT column_name 
+        FROM information_schema.columns 
+        WHERE table_name = 'prediction' 
+        AND column_name = 'user_sid'
+    """)
+
+    column_result = await db.execute(check_column_query)
+    has_user_sid_column = column_result.scalar() is not None
+
+    if has_user_sid_column:
+        result_query = await db.execute(
+            select(Prediction)
+            .options(
+                selectinload(Prediction.product).selectinload(Product.category)
             )
+            .where(
+                and_(
+                    Prediction.product_sid == product_sid,
+                    Prediction.user_sid == current_user.sid,
+                    Prediction.period_start >= datetime.now().date()
+                )
+            )
+            .order_by(Prediction.period_start.asc())
+            .limit(periods)
         )
-        .order_by(Prediction.period_start.asc())
-        .limit(periods)
-    )
+    else:
+        result_query = await db.execute(
+            select(Prediction)
+            .options(
+                selectinload(Prediction.product).selectinload(Product.category)
+            )
+            .where(
+                and_(
+                    Prediction.product_sid == product_sid,
+                    Prediction.period_start >= datetime.now().date()
+                )
+            )
+            .order_by(Prediction.period_start.asc())
+            .limit(periods)
+        )
 
     predictions = result_query.scalars().all()
     return predictions
