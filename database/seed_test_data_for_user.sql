@@ -6,7 +6,7 @@
 -- ВАЖНО: Замените email на реальный email вашего пользователя
 DO $$
 DECLARE
-    target_user_email VARCHAR := '220103378@stu.sdu.edu.kz'; -- <-- ЗАМЕНИТЕ НА СВОЙ EMAIL
+    target_user_email VARCHAR := 'aiventory@gmail.com'; -- <-- ЗАМЕНИТЕ НА СВОЙ EMAIL
     target_user_sid VARCHAR;
     v_upload_sid VARCHAR;
     category_count INTEGER;
@@ -409,7 +409,7 @@ LEFT JOIN warehouseitem wi ON up.sid = wi.upload_sid
 LEFT JOIN product p ON wi.product_sid = p.sid
 LEFT JOIN storeitem si ON wi.sid = si.warehouse_item_sid
 LEFT JOIN sale s ON si.sid = s.store_item_sid
-WHERE u.email = '220103378@stu.sdu.edu.kz'  -- <-- ЗАМЕНИТЕ НА СВОЙ EMAIL
+WHERE u.email = 'aiventory@gmail.com'  -- <-- ЗАМЕНИТЕ НА СВОЙ EMAIL
 GROUP BY u.email;
 
 -- Проверка данных для прогнозирования
@@ -426,7 +426,7 @@ JOIN warehouseitem wi ON si.warehouse_item_sid = wi.sid
 JOIN product p ON wi.product_sid = p.sid
 JOIN upload u ON wi.upload_sid = u.sid
 JOIN "user" usr ON u.user_sid = usr.sid
-WHERE usr.email = '220103378@stu.sdu.edu.kz'  -- <-- ЗАМЕНИТЕ НА СВОЙ EMAIL
+WHERE usr.email = 'aiventory@gmail.com'  -- <-- ЗАМЕНИТЕ НА СВОЙ EMAIL
 GROUP BY p.sid, p.name
 HAVING COUNT(DISTINCT DATE(s.sold_at)) >= 14
 ORDER BY sale_days DESC;

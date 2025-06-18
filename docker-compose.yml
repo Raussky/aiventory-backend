@@ -13,10 +13,12 @@ services:
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-inventory}"]
       interval: 5s
       timeout: 5s
       retries: 5
+    networks:
+      - inventory_network
 
   redis:
     image: redis:7-alpine
@@ -32,17 +34,14 @@ services:
     ports:
       - "${REDIS_PORT:-6379}:6379"
     healthcheck:
-      test: >
-        sh -c 'if [ -z "$${REDIS_PASSWORD}" ]; then
-          redis-cli --raw ping
-        else
-          redis-cli --raw -a "$${REDIS_PASSWORD}" ping
-        fi'
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 5
+    networks:
+      - inventory_network
 
-  # Отдельный сервис для миграций
+  # Миграции запускаются отдельно
   migrations:
     build:
       context: .
@@ -50,28 +49,21 @@ services:
     container_name: inventory_migrations
     environment:
       # Database
-      POSTGRES_SERVER: ${POSTGRES_SERVER:-postgres}
-      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_SERVER: postgres
+      POSTGRES_PORT: 5432
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-inventory}
-      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@${POSTGRES_SERVER:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-inventory}}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-inventory}
     volumes:
-      - ./alembic:/app/alembic
-      - ./app:/app/app
+      - ./alembic:/app/alembic:ro
+      - ./app:/app/app:ro
     depends_on:
       postgres:
         condition: service_healthy
-    command: >
-      sh -c "
-        echo 'Waiting for database...' &&
-        sleep 3 &&
-        echo 'Checking current migration status...' &&
-        alembic current &&
-        echo 'Running migrations...' &&
-        alembic upgrade head &&
-        echo 'Migrations completed!'
-      "
+    networks:
+      - inventory_network
+    command: /scripts/migrate.sh
 
   api:
     build:
@@ -80,16 +72,16 @@ services:
     container_name: inventory_api
     environment:
       # Database
-      POSTGRES_SERVER: ${POSTGRES_SERVER:-postgres}
-      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_SERVER: postgres
+      POSTGRES_PORT: 5432
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-inventory}
-      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@${POSTGRES_SERVER:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-inventory}}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-inventory}
 
       # Redis
-      REDIS_HOST: ${REDIS_HOST:-redis}
-      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
 
       # AWS
@@ -99,12 +91,21 @@ services:
       S3_BUCKET_NAME: ${S3_BUCKET_NAME:-aiventory-bucket}
 
       # App settings
-      SECRET_KEY: ${SECRET_KEY}
+      SECRET_KEY: ${SECRET_KEY:-your-secret-key-here}
       API_V1_STR: ${API_V1_STR:-/api/v1}
       ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-10080}
+
+      # Email settings
+      SMTP_TLS: ${SMTP_TLS:-True}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      EMAILS_FROM_EMAIL: ${EMAILS_FROM_EMAIL}
+      EMAILS_FROM_NAME: ${EMAILS_FROM_NAME:-AIventory System}
     volumes:
-      - ./app:/app/app
-      - ./alembic:/app/alembic
+      - ./app:/app/app:ro
+      - ./alembic:/app/alembic:ro
     ports:
       - "${API_PORT:-8000}:8000"
     depends_on:
@@ -114,8 +115,17 @@ services:
         condition: service_healthy
       migrations:
         condition: service_completed_successfully
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - inventory_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
 
+  # Celery воркер (опционально)
   celery_worker:
     build:
       context: .
@@ -123,22 +133,27 @@ services:
     container_name: inventory_celery_worker
     environment:
       # Копируем все переменные из api сервиса
-      POSTGRES_SERVER: ${POSTGRES_SERVER:-postgres}
-      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_SERVER: postgres
+      POSTGRES_PORT: 5432
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-inventory}
-      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@${POSTGRES_SERVER:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-inventory}}
-      REDIS_HOST: ${REDIS_HOST:-redis}
-      REDIS_PORT: ${REDIS_PORT:-6379}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-inventory}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
-      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-eu-north-1}
-      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-aiventory-bucket}
-      SECRET_KEY: ${SECRET_KEY}
+      SECRET_KEY: ${SECRET_KEY:-your-secret-key-here}
+
+      # Email settings для уведомлений
+      SMTP_TLS: ${SMTP_TLS:-True}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      EMAILS_FROM_EMAIL: ${EMAILS_FROM_EMAIL}
+      EMAILS_FROM_NAME: ${EMAILS_FROM_NAME:-AIventory System}
     volumes:
-      - ./app:/app/app
+      - ./app:/app/app:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -146,27 +161,30 @@ services:
         condition: service_healthy
       migrations:
         condition: service_completed_successfully
+    networks:
+      - inventory_network
     command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=${CELERY_CONCURRENCY:-2}
+    restart: unless-stopped
 
+  # Celery beat scheduler (опционально)
   celery_beat:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: inventory_celery_beat
     environment:
-      # Копируем все переменные из api сервиса
-      POSTGRES_SERVER: ${POSTGRES_SERVER:-postgres}
-      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_SERVER: postgres
+      POSTGRES_PORT: 5432
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-inventory}
-      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@${POSTGRES_SERVER:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-inventory}}
-      REDIS_HOST: ${REDIS_HOST:-redis}
-      REDIS_PORT: ${REDIS_PORT:-6379}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-inventory}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
-      SECRET_KEY: ${SECRET_KEY}
+      SECRET_KEY: ${SECRET_KEY:-your-secret-key-here}
     volumes:
-      - ./app:/app/app
+      - ./app:/app/app:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -174,40 +192,35 @@ services:
         condition: service_healthy
       migrations:
         condition: service_completed_successfully
+    networks:
+      - inventory_network
     command: celery -A app.tasks.celery_app beat --loglevel=info
+    restart: unless-stopped
 
+  # Flower для мониторинга Celery (опционально)
   flower:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: inventory_flower
     environment:
-      REDIS_HOST: ${REDIS_HOST:-redis}
-      REDIS_PORT: ${REDIS_PORT:-6379}
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      CELERY_BROKER_URL: redis://${REDIS_PASSWORD:+:${REDIS_PASSWORD}@}redis:6379/0
+      CELERY_RESULT_BACKEND: redis://${REDIS_PASSWORD:+:${REDIS_PASSWORD}@}redis:6379/0
       FLOWER_BASIC_AUTH: ${FLOWER_USER:-admin}:${FLOWER_PASSWORD:-admin}
     ports:
       - "${FLOWER_PORT:-5555}:5555"
     depends_on:
-      redis:
-        condition: service_healthy
-    command: celery -A app.tasks.celery_app flower --port=5555 ${FLOWER_BASIC_AUTH:+--basic_auth=${FLOWER_BASIC_AUTH}}
-
-  nginx:
-    image: nginx:alpine
-    container_name: inventory_nginx
-    volumes:
-      - ./nginx/conf:/etc/nginx/conf.d:ro
-      - ./frontend/dist:/usr/share/nginx/html:ro
-    ports:
-      - "${NGINX_PORT:-80}:80"
-    depends_on:
-      - api
+      - redis
+      - celery_worker
+    networks:
+      - inventory_network
+    command: celery -A app.tasks.celery_app flower --port=5555
+    restart: unless-stopped
 
 volumes:
   postgres_data:
   redis_data:
 
 networks:
-  default:
-    name: inventory_network
+  inventory_network:
+    driver: bridge
