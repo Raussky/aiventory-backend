@@ -42,6 +42,37 @@ services:
       timeout: 5s
       retries: 5
 
+  # Отдельный сервис для миграций
+  migrations:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: inventory_migrations
+    environment:
+      # Database
+      POSTGRES_SERVER: ${POSTGRES_SERVER:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-inventory}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@${POSTGRES_SERVER:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-inventory}}
+    volumes:
+      - ./alembic:/app/alembic
+      - ./app:/app/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: >
+      sh -c "
+        echo 'Waiting for database...' &&
+        sleep 3 &&
+        echo 'Checking current migration status...' &&
+        alembic current &&
+        echo 'Running migrations...' &&
+        alembic upgrade head &&
+        echo 'Migrations completed!'
+      "
+
   api:
     build:
       context: .
@@ -81,6 +112,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrations:
+        condition: service_completed_successfully
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
   celery_worker:
@@ -111,6 +144,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrations:
+        condition: service_completed_successfully
     command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=${CELERY_CONCURRENCY:-2}
 
   celery_beat:
@@ -137,6 +172,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrations:
+        condition: service_completed_successfully
     command: celery -A app.tasks.celery_app beat --loglevel=info
 
   flower:
