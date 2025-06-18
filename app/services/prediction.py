@@ -25,7 +25,6 @@ class PredictionService:
         self.model_version = "prophet_v2.0"
 
     async def get_sales_hash(self, product_sid: str) -> str:
-        """Получить хэш данных о продажах для проверки изменений"""
         query = text("""
             SELECT 
                 DATE(s.sold_at) as date,
@@ -57,7 +56,6 @@ class PredictionService:
         return hashlib.md5(data_str.encode()).hexdigest()
 
     async def check_if_forecast_needed(self, product_sid: str) -> bool:
-        """Проверить, нужно ли обновлять прогноз"""
         current_hash = await self.get_sales_hash(product_sid)
 
         last_forecast_query = await self.db.execute(
@@ -75,10 +73,6 @@ class PredictionService:
         )
         last_forecast = last_forecast_query.fetchone()
 
-        # Обновляем если:
-        # 1. Нет прогнозов вообще
-        # 2. Изменились данные о продажах
-        # 3. Прогноз старше 7 дней
         if not last_forecast:
             logger.info(f"No forecast found for product {product_sid}")
             return True
@@ -94,7 +88,6 @@ class PredictionService:
         return False
 
     async def get_sales_data(self, product_sid: str) -> pd.DataFrame:
-        """Получить данные о продажах для обучения модели"""
         query = text("""
             WITH daily_sales AS (
                 SELECT 
@@ -121,7 +114,6 @@ class PredictionService:
             ORDER BY ds
         """)
 
-        # Берем данные за последние 120 дней
         min_date = datetime.now() - timedelta(days=120)
 
         result = await self.db.execute(
@@ -134,7 +126,6 @@ class PredictionService:
             logger.warning(f"No sales data found for product {product_sid}")
             return pd.DataFrame()
 
-        # Создаем DataFrame
         df = pd.DataFrame([
             {"ds": row.ds, "y": float(row.y)}
             for row in rows
@@ -142,7 +133,6 @@ class PredictionService:
 
         logger.info(f"Found {len(df)} days of sales data for product {product_sid}")
 
-        # Проверяем минимальное количество уникальных дат
         unique_dates = df['ds'].nunique()
         if unique_dates < 7:
             logger.warning(f"Only {unique_dates} unique dates found for product {product_sid}")
@@ -150,7 +140,6 @@ class PredictionService:
 
         df['ds'] = pd.to_datetime(df['ds'])
 
-        # Заполняем пропущенные дни нулями
         date_range = pd.date_range(
             start=df['ds'].min(),
             end=datetime.now().date(),
@@ -161,7 +150,6 @@ class PredictionService:
         merged_df = pd.merge(date_df, df, on='ds', how='left')
         merged_df['y'] = merged_df['y'].fillna(0)
 
-        # Добавляем дополнительные признаки
         merged_df['day_of_week'] = merged_df['ds'].dt.dayofweek
         merged_df['day_of_month'] = merged_df['ds'].dt.day
         merged_df['month'] = merged_df['ds'].dt.month
@@ -175,21 +163,17 @@ class PredictionService:
             timeframe: TimeFrame = TimeFrame.DAY,
             periods_ahead: int = 90
     ) -> List[Dict[str, Any]]:
-        """Генерировать прогноз на указанный период"""
         try:
-            # Получаем данные о продажах
             df = await self.get_sales_data(product_sid)
 
             if df.empty:
                 logger.error(f"No sales data available for product {product_sid}")
                 return []
 
-            # Проверяем минимальное количество данных для Prophet
             if len(df) < 7:
                 logger.error(f"Not enough data for product {product_sid}: only {len(df)} days")
                 return []
 
-            # Проверяем наличие ненулевых продаж
             non_zero_sales = df[df['y'] > 0]
             if len(non_zero_sales) < 3:
                 logger.error(f"Not enough non-zero sales for product {product_sid}: only {len(non_zero_sales)} days")
@@ -197,20 +181,17 @@ class PredictionService:
 
             logger.info(f"Training Prophet model for product {product_sid} with {len(df)} days of data")
 
-            # Настраиваем модель Prophet с более простыми параметрами для малых данных
             if len(df) < 30:
-                # Упрощенная модель для малых данных
                 model = Prophet(
-                    yearly_seasonality=False,  # Отключаем годовую сезонность
+                    yearly_seasonality=False,
                     weekly_seasonality=True,
                     daily_seasonality=False,
                     seasonality_mode='additive',
-                    changepoint_prior_scale=0.1,  # Меньше изменений тренда
+                    changepoint_prior_scale=0.1,
                     interval_width=0.95,
                     growth='linear'
                 )
             else:
-                # Полная модель для достаточного количества данных
                 model = Prophet(
                     yearly_seasonality=len(df) > 365,
                     weekly_seasonality=True,
@@ -221,22 +202,17 @@ class PredictionService:
                     growth='linear'
                 )
 
-                # Добавляем месячную сезонность если достаточно данных
                 if len(df) > 60:
                     model.add_seasonality(name='monthly', period=30.5, fourier_order=5)
 
-            # Обучаем модель только на основных столбцах
             train_df = df[['ds', 'y']].copy()
             model.fit(train_df)
 
-            # Создаем датафрейм для прогноза
             future = model.make_future_dataframe(periods=periods_ahead)
             forecast = model.predict(future)
 
-            # Получаем хэш данных для метаинформации
             sales_hash = await self.get_sales_hash(product_sid)
 
-            # Формируем результаты прогноза
             today = datetime.now().date()
             results = []
 
@@ -251,7 +227,6 @@ class PredictionService:
                     period_start = today + timedelta(days=30 * (i + 1))
                     period_end = period_start + timedelta(days=29)
 
-                # Получаем прогноз на конкретную дату
                 forecast_row = forecast[forecast['ds'].dt.date == period_start]
 
                 if not forecast_row.empty:
@@ -259,7 +234,6 @@ class PredictionService:
                     forecast_lower = max(0, forecast_row['yhat_lower'].iloc[0])
                     forecast_upper = max(0, forecast_row['yhat_upper'].iloc[0])
                 else:
-                    # Используем среднее значение если нет точного прогноза
                     forecast_qty = df['y'].mean()
                     forecast_lower = forecast_qty * 0.8
                     forecast_upper = forecast_qty * 1.2
@@ -292,14 +266,12 @@ class PredictionService:
             return []
 
     async def save_forecast(self, forecasts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Сохранить прогнозы в базу данных"""
         if not forecasts:
             return []
 
         saved_predictions = []
 
         try:
-            # Удаляем старые прогнозы для этого продукта
             await self.db.execute(
                 delete(Prediction).where(
                     and_(
@@ -310,9 +282,7 @@ class PredictionService:
                 )
             )
 
-            # Сохраняем новые прогнозы
             for forecast in forecasts:
-                # Преобразуем meta_info в JSON строку
                 meta_info_str = json.dumps(forecast.get("meta_info", {}))
 
                 prediction = Prediction(
